@@ -1,0 +1,9 @@
+Per-video frame clustering for Paxos2025 cleaned videos, used by MILVideoDatasetCluster (--cluster_sample).
+
+extract_features.py: pretrained DINOv3 ViT-L CLS features (224px) for every frame -> frame_clusters/features/<stem>.npy
+train_contrastive.py: short InfoNCE on those features (port of retina_video_umap/train_contrastive.py); positives = within
+5 frames, negatives = >= 30 frames apart, measured in cleaned-video frame indices -> frame_clusters/contrastive/
+cluster_frames.py: k=32 cosine (spherical) k-means per video on the contrastive embeddings -> frame_clusters/clusters/<stem>.json
+({"num_frames", "k", "clusters": [[frame idxs]], "medoids"}), clusters ordered by medoid frame index.
+
+Training: one random frame per cluster (re-drawn every epoch), validation: cluster medoids.

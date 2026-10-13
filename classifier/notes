@@ -1,25 +1,12 @@
-Performed Grid-Search over the 8 different EfficientNet versions (three runs each, ImageNet init) on the cropped frames.
--> As long as not B0, it does not really matter; B4 should be a save choice
--> Details of this can be found in the runs folder; no model folders in here anymore (not needed, B4 is the reference)
+filter_frames.py and sample.py are only relevant when we don't want to use the manually selected frames.
 
-Compared B4 with ImageNet weights against B4 with weigths further trained on Kaggle dataset.
--> Clear advantage of adding the Kaggle pre-training
+Instead, we sample a few frames per video that get a high informativeness score.
 
-Further compared to DINOv3 ViT-L/16 with pre-trained weights given LVD-1689M.
-Tested four versions: Either frozen DINOv3 or not (only train classifier head); Either use cls token or mean of patch tokens.
--> Frozen worse than fine-tuned
--> Frozen patchmean worse than cls
--> Fine-tuned versions very similar (expected because models can be tuned to be identical -> Info in patchmean and cls probably the same in the end)
+Results showed that this method still allows to train a strong classifier, at least for the binary case, since
+relevant biomarkers seem to be frequent enough to justify the automatic grading of frames based on the video grade.
+However, for the multi-class case this assumption probably does not hold since only a few frames might carry the
+relevant information.
+Apart from that, we do have manually selected frames for all videos, so just using these frames is superior.
 
-Additionally trained fine-tuned cls DINOv3 version with same pre-processing as the EfficientNet (DINOv3 augs quite conservative).
--> Seems to be a bit worse than the other two fine-tuned; might be because the val set is close to val set, so the robustness that might be
-created by using the rotations and flips and so on is not needed for good results on the val set and therefore performance is slightly worse
-    -> However, in the end the performance for the MIL model is the most important and not the one of the classifier in isolation
-
-models now contains the 5 runs for the 5 splits of DINOv3 without Kaggle fine-tuning, with the complex augmentations,
-un-frozen backbone and trained with the cls token
-
-scripts regarding the EfficientNet classifier are gone and can only be found in the git repo
-
-utils.py:
-some utils used for training the classifier
+Basically, all the files regarding this automatic selection could be deleted, since the method is not used.
+The stuff still remains for now.

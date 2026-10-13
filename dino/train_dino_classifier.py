@@ -60,13 +60,13 @@ class DinoClassifier(nn.Module):
 def train_classifier(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    timestamp = datetime.now().strftime('%m%d_%H%M')
-    # run_name = f"dino_{'complex' if args.complex_augs else 'simple'}_{args.split_path.split('/')[-1]}_{'kaggle' if args.weight_path else 'imagenet'}_{timestamp}"
-    run_name = (f"dino_"
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    description = (f"dino_"
                 f"{"binary" if args.binary_classification else "all"}_"
                 f"{args.split_path.split('/')[-1]}_"
-                f"{timestamp}_"
                 f"{"full" if args.train_json == "frame_train.json" else args.train_json.split(".")[0].split("_")[-1]}")
+    run_name = (f"{timestamp}_{description}"
+                f"{f'_{args.run_tag}' if args.run_tag else ''}")
 
     run_dir = os.path.join("classifier", "models", run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -215,6 +215,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--complex_augs', action='store_true')
+    parser.add_argument('--run_tag', type=str, default=None,
+                        help='Optional short suffix appended to the run name (e.g. an experiment label).')
 
     args = parser.parse_args()
 

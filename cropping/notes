@@ -10,4 +10,4 @@ takes both the sampled frames and the annotations to train five Unet++ (B4 backb
 five different splits (saved in cv_splits.json)
 
 segment_frames.py:
-takes the selected frames in data/2024_Paxos_Frames/frames, crops them and saves the results to data/2024_Paxos_Frames/cropped_frames
+takes a folder of sampled frames, crops them and saves the results to another folder.

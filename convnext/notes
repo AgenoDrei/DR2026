@@ -1,0 +1,15 @@
+DINOv3 ConvNeXt-L backbone + same transformer head as dino/train_dino_transformer.py
+- backbone starts from DINOv3 LVD-1689M weights (no DinoClassifier stage), trained end-to-end on video bags
+- adapter turns the 1536x16x16 feature map (512px input) into one 1024-d vector per frame:
+  linear_attnpool (1x1 conv + LN + 2D sin/cos PE + learnable-query attention pooling, default) or linear_mean
+- no temporal encoding, no attention entropy loss
+- defaults = best unfrozen hp sweep config (8 heads, 1 block, lr 5e-5, backbone_lr_mult 0.3, distance_scale 0.2), but 12 epochs / lr_step 6 (generic, not DR-tuned, backbone needs longer than the ViT runs)
+- final LayerNorm after the transformer blocks (proper pre-norm stack, unlike dino/train_dino_transformer.py)
+- gradient accumulation was tried and removed (one optimizer step per video, shared transformer.utils.train_one_epoch_trans)
+- Paxos2025 only: job script uses mil_{train,val}_2025.json, no --fused_dataset
+
+2026-10-13 collapse diagnosis
+- first runs (raw features, accum 4, lr 5e-5; frozen lr 3e-4) predicted one grade for all val videos every epoch (QWK 0)
+- generic ConvNeXt features: cos sim between videos ~0.94 (one shared direction), but a standardized logistic-regression probe on GAP features gets val QWK ~0.78
+- fix: per-channel standardization of the feature map with train-set stats (feat_mean/feat_std buffers)
+- head-only tests on cached frozen features: lr 3e-4 always collapses (even with grad clipping), lr 1e-4 seed-dependent (0.56-0.77), lr 5e-5/3e-5 standardized stable (~0.80-0.82); distance scaling no clear effect; linear_mean ~ linear_attnpool

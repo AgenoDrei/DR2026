@@ -1,0 +1,18 @@
+- Fix single-bottleneck-vector aggregation in dino/train_dino_transformer.py::DinoSelfAttention.forward_head
+  (classifier head currently only reads x[:, 0, :], the CLS token):
+  1. Concat CLS + mean-pooled frame tokens before the classifier head, i.e.
+     cat([x[:, 0, :], x[:, 1:, :].mean(dim=1)]), double the head's input dim.
+     Cheapest option, try first.
+  2. Multiple aggregator tokens (replace single cls_token with N learnable query
+     tokens, concat/pool their final states before the classifier head).
+  Motivation: top-5-attention-frame check showed 11/17 grade-2-videos-misclassified-
+  as-grade-0 had the frame-level DinoClassifier correctly predict grade 2 on at
+  least one of those exact frames -> aggregator is losing signal that's present
+  per-frame.
+
+- Test --attn_entropy_weight (transformer/utils.py::train_one_epoch_trans,
+  dino/train_dino_transformer.py). Implemented but never actually run -
+  currently disabled (0.0) in favor of --distance_scale_weight 0.2 in the
+  run launched 2026-10-08. Try it alone and/or combined with distance scaling.
+
+- Run parameter grid/random search on 1 fold, don't forget to do it on frozen backbone /w small amount of epochs (~5)

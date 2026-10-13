@@ -190,7 +190,7 @@ def main():
         writer.close()
 
     # Save final aggregate split info
-    pd.DataFrame(all_split_info).to_csv(f'split_info_5fold_{timestamp}.csv', index=False)
+    pd.DataFrame(all_split_info).to_csv(f'informative_frames/split_info_5fold_{timestamp}.csv', index=False)
 
 
 if __name__ == "__main__":

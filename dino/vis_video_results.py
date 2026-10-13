@@ -6,16 +6,17 @@ import re
 from PIL import Image
 from tqdm import tqdm
 import argparse
-from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
 from data.dataset import MILVideoDataset
 from dino.utils import make_val_transform_dino
-from dino.train_dino_mil import DinoMIL
 from dino.train_dino_transformer import DinoSelfAttention
 from dino.train_dino_classifier import DinoClassifier
 
 
+# ----------------------------------------------------------------------------
+# Datasets
+# ----------------------------------------------------------------------------
 class FrameDataset(Dataset):
     def __init__(self, json_path, img_dirs, transform=None):
         with open(json_path, 'r') as f:
@@ -76,7 +77,52 @@ def match_img_to_video(img_name, vid_names):
     return None
 
 
-def run_inference_transformer(model, loader, device):
+# ----------------------------------------------------------------------------
+# Shared helpers
+# ----------------------------------------------------------------------------
+def to_probs(logits, num_classes):
+    """Logits -> probabilities of shape (N, C). Binary: sigmoid with C=1. Multi-class: softmax."""
+    if num_classes == 1:
+        return torch.sigmoid(logits.reshape(-1, 1))
+    return torch.softmax(logits.reshape(-1, num_classes), dim=1)
+
+
+def make_result(label, grade, probs):
+    """Builds a result dict from a 1D probability tensor (length 1 = binary, else multi-class)."""
+    result = {"label": int(label), "grade": int(grade)}
+    if probs.numel() == 1:
+        result["prob"] = probs[0].item()
+    else:
+        result["pred_grade"] = int(torch.argmax(probs).item())
+        for c in range(probs.numel()):
+            result[f"prob_{c}"] = probs[c].item()
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Model types: each has a builder and an inference function.
+#   builder(path, num_classes, device)                   -> model
+#   infer(model, loader, device, num_classes, vid_names) -> {video_name: result_dict}
+# "data" says which loader the model consumes: "video" or "frame".
+# To support a new model type, write both functions and add it to MODEL_REGISTRY.
+# ----------------------------------------------------------------------------
+def infer_num_blocks(path):
+    """Reads the number of transformer blocks from a DinoSelfAttention checkpoint."""
+    state_dict = torch.load(path, map_location="cpu")
+    block_ids = {int(m.group(1)) for k in state_dict if (m := re.match(r"blocks\.(\d+)\.", k))}
+    if not block_ids:
+        raise ValueError(f"No 'blocks.N.' keys found in {path}. Is this a DinoSelfAttention checkpoint?")
+    return max(block_ids) + 1
+
+
+def build_transformer(path, num_classes, device):
+    kwargs = {} if num_classes == 1 else {"num_classes": num_classes}
+    return DinoSelfAttention(full_checkpoint_path=path,
+                             num_blocks=infer_num_blocks(path),
+                             **kwargs).to(device)
+
+
+def infer_transformer(model, loader, device, num_classes, vid_names):
     model.eval()
     results = {}
     dataset_samples = loader.dataset.data
@@ -89,123 +135,120 @@ def run_inference_transformer(model, loader, device):
             video_name = dataset_samples[i]['vid_name']
 
             logits, _ = model(inputs)
-            prob = torch.sigmoid(logits).item()
+            probs = to_probs(logits, num_classes)[0]
 
-            results[video_name] = {
-                "label": int(labels.item()),
-                "prob": prob,
-                "grade": int(grade.item())
-            }
+            results[video_name] = make_result(labels.item(), grade.item(), probs)
     return results
 
 
-def run_inference_transformer_all(model, loader, device, num_classes=5):
+def build_classifier(path, num_classes, device):
+    model = DinoClassifier(freeze_backbone=True, num_classes=num_classes).to(device)
+    state_dict = torch.load(path, map_location=device)
+    model.load_state_dict(state_dict)
+    return model
+
+
+def infer_classifier_frames(model, loader, device, num_classes, vid_names):
+    """Classifier on the manually selected, pre-extracted frames.
+    Predicts per frame and averages probabilities per video."""
+    model.eval()
+    video_probs = {v: [] for v in vid_names}
+    video_labels = {}
+    video_grades = {}
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Classifier Frames Inference"):
+            inputs, grades, labels, img_names = batch
+            inputs = inputs.to(device)
+
+            probs = to_probs(model(inputs), num_classes).cpu()
+
+            for i, img_name in enumerate(img_names):
+                v_name = match_img_to_video(img_name, vid_names)
+                if v_name:
+                    video_probs[v_name].append(probs[i])
+                    video_labels[v_name] = int(labels[i].item())
+                    video_grades[v_name] = int(grades[i].item())
+
+    results = {}
+    for v_name in vid_names:
+        if video_probs[v_name]:
+            avg_prob = torch.stack(video_probs[v_name]).mean(dim=0)
+            results[v_name] = make_result(video_labels[v_name], video_grades[v_name], avg_prob)
+        else:
+            print(f"Warning: No frames matched for video {v_name}")
+
+    return results
+
+
+def infer_classifier_video(model, loader, device, num_classes, vid_names):
+    """Classifier on the same 32 frames the transformer gets.
+    Predicts per frame and averages probabilities per video."""
     model.eval()
     results = {}
     dataset_samples = loader.dataset.data
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc="Transformer Inference")):
-            inputs = batch[0].squeeze(0).to(device)
+        for i, batch in enumerate(tqdm(loader, desc="Classifier Video-Frames Inference")):
+            inputs = batch[0].squeeze(0).to(device)  # (32, C, H, W)
             labels = batch[1]
             grade = batch[2]
             video_name = dataset_samples[i]['vid_name']
 
-            logits, _ = model(inputs)
-            probs = torch.softmax(logits, dim=1).squeeze(0)
-            pred_grade = int(torch.argmax(probs).item())
-
-            result = {
-                "label": int(labels.item()),
-                "grade": int(grade.item()),
-                "pred_grade": pred_grade,
-            }
-            for c in range(num_classes):
-                result[f"prob_{c}"] = probs[c].item()
-
-            results[video_name] = result
+            probs = to_probs(model(inputs), num_classes).mean(dim=0)
+            results[video_name] = make_result(labels.item(), grade.item(), probs)
 
     return results
 
 
-def run_inference_classifier_frames(model, loader, device, vid_names):
-    """Predicts on individual frames and averages probabilities per video for binary classification."""
-    model.eval()
-    video_probs = {v: [] for v in vid_names}
-    video_labels = {}
-    video_grades = {}
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Classifier Frames Inference (Binary)"):
-            inputs, grades, labels, img_names = batch
-            inputs = inputs.to(device)
-
-            logits = model(inputs)
-            probs = torch.sigmoid(logits).squeeze(-1)
-
-            for i, img_name in enumerate(img_names):
-                v_name = match_img_to_video(img_name, vid_names)
-                if v_name:
-                    video_probs[v_name].append(probs[i].item())
-                    video_labels[v_name] = int(labels[i].item())
-                    video_grades[v_name] = int(grades[i].item())
-
-    results = {}
-    for v_name in vid_names:
-        if video_probs[v_name]:
-            results[v_name] = {
-                "label": video_labels[v_name],
-                "prob": sum(video_probs[v_name]) / len(video_probs[v_name]),
-                "grade": video_grades[v_name]
-            }
-        else:
-            print(f"Warning: No frames matched for video {v_name}")
-
-    return results
+MODEL_REGISTRY = {
+    "transformer":      {"data": "video", "build": build_transformer, "infer": infer_transformer},
+    "classifier":       {"data": "frame", "build": build_classifier,  "infer": infer_classifier_frames},
+    "classifier_video": {"data": "video", "build": build_classifier,  "infer": infer_classifier_video},
+}
 
 
-def run_inference_classifier_frames_all(model, loader, device, vid_names, num_classes=5):
-    """Predicts on individual frames and averages probabilities per video for 5-class grading."""
-    model.eval()
-    video_probs = {v: [] for v in vid_names}
-    video_labels = {}
-    video_grades = {}
+# ----------------------------------------------------------------------------
+# Output formatting
+# ----------------------------------------------------------------------------
+def format_model_columns(results, name, run_name, num_classes):
+    """Turns one model's results into a DataFrame with model-specific column names.
+    Keeps label/grade (merged later) plus renamed prediction columns."""
+    df = pd.DataFrame.from_dict(results, orient='index')
+    if num_classes == 1:
+        df = df.rename(columns={"prob": f"{name}_{run_name}"})
+        pred_cols = [f"{name}_{run_name}"]
+    else:
+        rename = {f"prob_{c}": f"{name}_prob_{c}" for c in range(num_classes)}
+        rename["pred_grade"] = f"{name}_pred_grade_{run_name}"
+        df = df.rename(columns=rename)
+        pred_cols = [f"{name}_pred_grade_{run_name}"] + [f"{name}_prob_{c}" for c in range(num_classes)]
+    return df, pred_cols
 
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Classifier Frames Inference (Multi-class)"):
-            inputs, grades, labels, img_names = batch
-            inputs = inputs.to(device)
 
-            logits = model(inputs)
-            probs = torch.softmax(logits, dim=1)
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def parse_models(model_args, splits):
+    """Parses repeated `--model NAME TYPE PATH...` into a list of dicts and validates it."""
+    models = []
+    seen = set()
+    for spec in model_args:
+        if len(spec) < 3:
+            raise ValueError(f"--model needs NAME TYPE PATH [PATH ...], got: {spec}")
+        name, mtype, paths = spec[0], spec[1], spec[2:]
 
-            for i, img_name in enumerate(img_names):
-                v_name = match_img_to_video(img_name, vid_names)
-                if v_name:
-                    video_probs[v_name].append(probs[i].cpu())
-                    video_labels[v_name] = int(labels[i].item())
-                    video_grades[v_name] = int(grades[i].item())
-
-    results = {}
-    for v_name in vid_names:
-        if video_probs[v_name]:
-            stacked = torch.stack(video_probs[v_name])
-            avg_prob = stacked.mean(dim=0)
-            pred_grade = int(torch.argmax(avg_prob).item())
-
-            result = {
-                "label": video_labels[v_name],
-                "grade": video_grades[v_name],
-                "pred_grade": pred_grade,
-            }
-            for c in range(num_classes):
-                result[f"prob_{c}"] = avg_prob[c].item()
-
-            results[v_name] = result
-        else:
-            print(f"Warning: No frames matched for video {v_name}")
-
-    return results
+        if mtype not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown model type '{mtype}' for '{name}'. "
+                             f"Available: {list(MODEL_REGISTRY)}")
+        if name in seen:
+            raise ValueError(f"Duplicate model name '{name}'.")
+        seen.add(name)
+        if len(paths) != len(splits):
+            raise ValueError(f"Model '{name}' has {len(paths)} path(s) but {len(splits)} split(s) "
+                             f"were requested ({splits}).")
+        models.append({"name": name, "type": mtype, "paths": paths})
+    return models
 
 
 def main(args):
@@ -213,107 +256,85 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
 
-    for split in [1, 2, 3, 4, 5]:
-        csv_path = os.path.join(args.output_dir, f"predictions_split_{split}_{args.dataset_name}.csv")
+    num_classes = 1 if args.binary_classification else args.num_classes
+    models = parse_models(args.model, args.splits)
+    needs_frames = any(MODEL_REGISTRY[m["type"]]["data"] == "frame" for m in models)
 
-        # 1. Load Video Split (Transformer)
+    for split_idx, split in enumerate(args.splits):
+        run_name = f"split_{split}"
+        csv_path = os.path.join(args.output_dir, f"predictions_{run_name}_{args.dataset_name}.csv")
+        print(f"\n>>> Evaluating Run: {run_name}")
+
+        # Video split (always needed: transformer / classifier_video input and video names)
         val_ds = MILVideoDataset(
-            json_path=os.path.join(args.annotations_path, f"split_{split}", f"mil_val_{args.dataset_name}.json"),
+            json_path=os.path.join(args.annotations_path, run_name, f"mil_val_{args.dataset_name}.json"),
             num_frames=32,
             transform=val_trans,
             search_dir_paths=[args.videos_path],
         )
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+        loaders = {"video": DataLoader(val_ds, batch_size=1, shuffle=False)}
         vid_names = [sample['vid_name'] for sample in val_ds.data]
 
-        # 2. Load Frame Split (Classifier)
-        frame_json_path = os.path.join(args.frame_annotations_path, f"split_{split}", f"frame_val_{args.dataset_name}.json")
-        frame_ds = FrameDataset(
-            json_path=frame_json_path,
-            img_dirs=[args.frame_img_dir],
-            transform=val_trans
-        )
-        frame_loader = DataLoader(frame_ds, batch_size=32, shuffle=False, num_workers=4)
-
-        run_name = f"split_{split}"
-        print(f"\n>>> Evaluating Run: {run_name}")
-
-        if args.binary_classification:
-            # Transformer
-            trans_model = DinoSelfAttention(full_checkpoint_path=args.trans_paths[split - 1]).to(device)
-            trans_results = run_inference_transformer(trans_model, val_loader, device)
-
-            # Classifier
-            classifier = DinoClassifier(freeze_backbone=True, num_classes=1).to(device)
-            state_dict = torch.load(args.classifier_paths[split - 1], map_location=device)
-            classifier.load_state_dict(state_dict)
-            clf_results = run_inference_classifier_frames(classifier, frame_loader, device, vid_names)
-
-            df_clf = pd.DataFrame.from_dict(clf_results, orient='index')
-            df_clf = df_clf.rename(columns={'prob': f"Clf_{run_name}"}).drop(columns=['label', 'grade'], errors='ignore')
-
-            df_trans = pd.DataFrame.from_dict(trans_results, orient='index')
-            df_trans = df_trans.rename(columns={'prob': f"Trans_{run_name}"})
-
-            master_df = df_trans.join(df_clf)
-            master_df.index.name = 'video'
-            master_df = master_df[['label', f"Clf_{run_name}", f"Trans_{run_name}", "grade"]]
-            master_df.to_csv(csv_path)
-
-        else:
-            # Transformer
-            trans_model = DinoSelfAttention(full_checkpoint_path=args.trans_paths[split - 1], num_classes=5).to(device)
-            trans_results = run_inference_transformer_all(trans_model, val_loader, device)
-
-            # Classifier
-            classifier = DinoClassifier(freeze_backbone=True, num_classes=5).to(device)
-            state_dict = torch.load(args.classifier_paths[split - 1], map_location=device)
-            classifier.load_state_dict(state_dict)
-            clf_results = run_inference_classifier_frames_all(classifier, frame_loader, device, vid_names)
-
-            prob_cols = [f"prob_{c}" for c in range(5)]
-            df_clf = pd.DataFrame.from_dict(clf_results, orient='index')
-            df_trans = pd.DataFrame.from_dict(trans_results, orient='index')
-
-            clf_rename_dict = {col: f"Clf_{col}" for col in prob_cols}
-            clf_rename_dict['pred_grade'] = f"Clf_pred_grade_{run_name}"
-            df_clf = df_clf.rename(columns=clf_rename_dict).drop(columns=['label', 'grade'], errors='ignore')
-
-            trans_rename_dict = {col: f"Trans_{col}" for col in prob_cols}
-            trans_rename_dict['pred_grade'] = f"Trans_pred_grade_{run_name}"
-            df_trans = df_trans.rename(columns=trans_rename_dict)
-
-            master_df = df_trans.join(df_clf)
-            master_df.index.name = 'video'
-
-            clf_prob_cols = [f"Clf_{c}" for c in prob_cols]
-            trans_prob_cols = [f"Trans_{c}" for c in prob_cols]
-
-            ordered_cols = (
-                ['label', 'grade', f"Clf_pred_grade_{run_name}", f"Trans_pred_grade_{run_name}"]
-                + clf_prob_cols
-                + trans_prob_cols
+        # Frame split (only if a frame-based model is requested)
+        if needs_frames:
+            frame_json_path = os.path.join(args.frame_annotations_path, run_name,
+                                           f"frame_val_{args.dataset_name}.json")
+            frame_ds = FrameDataset(
+                json_path=frame_json_path,
+                img_dirs=[args.frame_img_dir],
+                transform=val_trans
             )
+            loaders["frame"] = DataLoader(frame_ds, batch_size=32, shuffle=False, num_workers=4)
 
-            master_df = master_df[ordered_cols]
-            master_df.to_csv(csv_path)
+        base_df = None
+        pred_columns = []
+
+        for m in models:
+            spec = MODEL_REGISTRY[m["type"]]
+            print(f"--- {m['name']} ({m['type']}): {m['paths'][split_idx]}")
+
+            model = spec["build"](m["paths"][split_idx], num_classes, device)
+            results = spec["infer"](model, loaders[spec["data"]], device, num_classes, vid_names)
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            df, pred_cols = format_model_columns(results, m["name"], run_name, num_classes)
+            pred_columns.extend(pred_cols)
+
+            if base_df is None:
+                base_df = df[["label", "grade"] + pred_cols]
+            else:
+                base_df = base_df.join(df[pred_cols], how="outer")
+
+        base_df.index.name = 'video'
+        base_df = base_df[["label", "grade"] + pred_columns]
+        base_df.to_csv(csv_path)
+        print(f"Saved {csv_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--trans_paths', nargs='+', required=True, help="List of 5 Transformer checkpoint paths")
-    parser.add_argument('--classifier_paths', nargs='+', required=True, help="List of 5 Classifier checkpoint paths")
+    parser.add_argument(
+        '--model', action='append', nargs='+', required=True,
+        metavar=('NAME', 'TYPE_AND_PATHS'),
+        help=("Repeatable. Format: --model NAME TYPE PATH_1 [PATH_2 ...] with one checkpoint path per "
+              f"split in --splits. TYPE is one of {list(MODEL_REGISTRY)}.")
+    )
+    parser.add_argument('--splits', nargs='+', type=int, default=[1, 2, 3, 4, 5],
+                        help="Which splits to evaluate; each --model needs one path per split.")
 
     # Frame dataset arguments
     parser.add_argument('--frame_annotations_path', type=str, default="data/stratified_splits")
     parser.add_argument('--frame_img_dir', default="data/2024_Paxos_Frames/cropped_matched_frames")
 
-    parser.add_argument('--dataset_name', type=str, required=True, default="paxos2020")
+    parser.add_argument('--dataset_name', type=str, required=True)
     parser.add_argument('--annotations_path', type=str, default="data/stratified_splits")
     parser.add_argument('--videos_path', type=str, default="data/ensemble_results_paxos2020/cleaned_videos")
     parser.add_argument('--output_dir', type=str, default="multi_eval")
     parser.add_argument('--img_size', type=int, default=512)
+    parser.add_argument('--num_classes', type=int, default=5, help="Used when not --binary_classification.")
     parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--binary_classification', action='store_true')
 

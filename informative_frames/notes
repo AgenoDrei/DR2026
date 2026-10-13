@@ -1,16 +1,13 @@
 sample_frames.py: Takes videos from data/dr_videos and samples 7 frames to data/informative_frames/frames_raw_extract
 
-grade_frames.py: Take frames from data/frames_raw_extract and grade into 2 (or 3) classes using an interface.
-At the moment only the 2 class setting is used.
+grade_frames.py: Take frames from data/frames_raw_extract and grade into 2 classes using an interface.
 
-crop_frames.py: Use the 5 trained cropping models to crop the extracted frames (data/informative_frames/frames_raw_extract)
-and move them to 0 and 1 folders in data/informative_frames/frames_cropped
+crop_frames.py: Use the 5 trained cropping models to crop the extracted frames and move them to 0 and 1 folders
 
 classify_frames.py: Use images in data/informative_frames/frames_cropped to train 5 EfficientNets for classifying frames
 into informative and not with 5 splits. Models are saved in models. split_info_5fold_{timestamp}.csv saves the
 mapping
 
 extract_inf_frames.py: Use trained cropping model ensemble and trained informative frames model ensemble to both crop
-and filter all videos in data/dr_videos;
-results are saved in ensemble_results (at the moment, needs to be moved to data) and contains the clips and txts/plots
-that visualize the confidences for each frame
+and filter all videos in a video folder;
+results are saved in cleaned_videos and contains the clips and txts/plots that visualize the confidences for each frame

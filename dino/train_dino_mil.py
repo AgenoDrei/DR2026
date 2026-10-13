@@ -127,8 +127,9 @@ class DinoMIL(nn.Module):
 def train_mil(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    timestamp = datetime.now().strftime('%m%d_%H%M')
-    run_name = f"dino_mil_{'complex' if args.complex_augs else 'simple'}_{args.split_path.split('/')[-1]}_{'segmented' if args.random_segment_sample else 'uniform'}_{timestamp}"
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    description = f"dino_mil_{'complex' if args.complex_augs else 'simple'}_{args.split_path.split('/')[-1]}_{'segmented' if args.random_segment_sample else 'uniform'}"
+    run_name = f"{timestamp}_{description}" + (f"_{args.run_tag}" if args.run_tag else "")
 
     run_dir = os.path.join("mil", "models", run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -249,6 +250,8 @@ if __name__ == "__main__":
     parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--random_segment_sample', action='store_true')
     parser.add_argument('--fused_dataset', action='store_true')
+    parser.add_argument('--run_tag', type=str, default=None,
+                        help='Optional short suffix appended to the run name (e.g. an experiment label).')
 
     args = parser.parse_args()
 

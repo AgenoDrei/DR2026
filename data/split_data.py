@@ -209,6 +209,11 @@ if __name__ == '__main__':
                 "matching_path": "data/matching_results_2025.json",
                 "clip_labels_path": "data/clip_labels_2025.json",
             },
+            {
+                "name": "2020",
+                "matching_path": "data/matching_results_2020.json",
+                "clip_labels_path": "data/clip_labels_2020.json",
+            },
         ],
         n_splits=5,
         output_dir="data/stratified_splits",

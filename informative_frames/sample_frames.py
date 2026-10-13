@@ -1,9 +1,9 @@
 import cv2
 from pathlib import Path
 
-# VIDEO_DIR = Path('data/dr_videos')
-VIDEO_DIR = Path('data/Paxos_2020_videos')
-OUTPUT_DIR = Path('data/informative_frames/frames_raw_extract_paxos2020')
+VIDEO_DIR = Path('data/dr_videos')
+# VIDEO_DIR = Path('/home/user/mueller9/Data/2020_Paxos_Videos/data')
+OUTPUT_DIR = Path('data/informative_frames/frames_raw_extract')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -26,7 +26,10 @@ def extract_fast_lossless():
             cap.release()
             continue
 
-        targets = [int(total_frames * f) for f in [0.2, 0.4, 0.6, 0.8]]
+        # 7-frame scheme matches informative_frames/split_info_full.csv (Paxos2025 labels)
+        targets = [int(total_frames * k / 8) for k in range(1, 8)]
+        # 4-frame scheme matches informative_frames/manual_labels_binary_paxos2020.csv (Paxos2020 labels)
+        # targets = [int(total_frames * f) for f in [0.2, 0.4, 0.6, 0.8]]
 
         print(f"Processing: {video_path.name}")
 

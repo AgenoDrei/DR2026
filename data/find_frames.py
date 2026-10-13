@@ -1,6 +1,9 @@
+import argparse
 import re
 from pathlib import Path
 import cv2
+
+cv2.setNumThreads(1)  # avoid each parallel worker oversubscribing CPU cores internally
 
 try:
     from colorama import Fore, Style, init
@@ -133,8 +136,18 @@ def adaptive_search(template, video):
 
 
 def main():
-    images = list(IMAGE_DIR.rglob("*.png"))
-    print(f"{INFO}Found {len(images)} PNG images in '{IMAGE_DIR}'. Matching against '{VIDEO_DIR}'...{RESET}\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num_shards', type=int, default=1)
+    parser.add_argument('--shard_index', type=int, default=0)
+    parser.add_argument('--skip_first', type=int, default=0,
+                        help="Skip this many images at the start of this shard's list (for resuming).")
+    args = parser.parse_args()
+
+    all_images = sorted(IMAGE_DIR.rglob("*.png"))
+    images = all_images[args.shard_index::args.num_shards][args.skip_first:]
+    print(f"{INFO}Found {len(all_images)} PNG images in '{IMAGE_DIR}' "
+          f"(shard {args.shard_index}/{args.num_shards}: {len(images)} images). "
+          f"Matching against '{VIDEO_DIR}'...{RESET}\n")
 
     for idx, image_path in enumerate(images, start=1):
         video = videos.get(key(image_path))

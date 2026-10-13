@@ -129,22 +129,10 @@ class MILVideoDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        bag = self._load_video_frames(item['path'])
+        bag = self._load_video_frames(item)
         return bag, torch.tensor(item['label'], dtype=torch.float32), torch.tensor(item['grade'])
 
-    def _load_video_frames(self, path):
-        frames = []
-        cap = cv2.VideoCapture(path)
-
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file: {path}")
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total_frames <= 0:
-            cap.release()
-            raise RuntimeError(f"Video {path} has 0 frames or unreadable metadata.")
-
+    def _sample_indices(self, item, total_frames):
         if not self.random_segment_sample:
             # 1. Uniform Sampling (Deterministic)
             target_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int).tolist()
@@ -168,7 +156,23 @@ class MILVideoDataset(Dataset):
 
             # Ensure they are sorted so the sequential OpenCV reader works properly
             target_indices.sort()
-        # ==========================================
+        return target_indices
+
+    def _load_video_frames(self, item):
+        path = item['path']
+        frames = []
+        cap = cv2.VideoCapture(path)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video file: {path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if total_frames <= 0:
+            cap.release()
+            raise RuntimeError(f"Video {path} has 0 frames or unreadable metadata.")
+
+        target_indices = self._sample_indices(item, total_frames)
 
         last_valid_frame = None
 
@@ -207,6 +211,62 @@ class MILVideoDataset(Dataset):
                 f"Critical failure: Expected {self.num_frames} frames from {path}, but ended up with {len(frames)}.")
 
         return torch.stack(frames)
+
+
+class MILVideoDatasetCluster(MILVideoDataset):
+    """
+    MILVideoDataset that samples one frame per k-means cluster (see clustering/cluster_frames.py)
+    instead of by time: random_segment_sample=True draws a random member per cluster (train),
+    otherwise each cluster's medoid is used (val). Cluster JSONs are matched like the videos,
+    from `cluster_dir_paths` (default: `frame_clusters/clusters` sibling of each `cleaned_videos`).
+    """
+
+    def __init__(self, json_path, num_frames=32, transform=None, random_segment_sample=False,
+                 search_dir_paths=None, cluster_dir_paths=None):
+        super().__init__(json_path, num_frames=num_frames, transform=transform,
+                         random_segment_sample=random_segment_sample, search_dir_paths=search_dir_paths)
+
+        if search_dir_paths is None:
+            search_dir_paths = ["data/ensemble_results/cleaned_videos"]
+        if cluster_dir_paths is None:
+            cluster_dir_paths = [p.replace("cleaned_videos", "frame_clusters/clusters") for p in search_dir_paths]
+
+        all_cluster_paths = []
+        for cluster_dir_path in cluster_dir_paths:
+            cluster_dir = Path(cluster_dir_path)
+            if cluster_dir.exists():
+                all_cluster_paths.extend(cluster_dir.glob("*.json"))
+
+        kept, missing_cluster_count = [], 0
+        for item in self.data:
+            video_stem = Path(item['path']).stem
+            matched = next((p for p in all_cluster_paths if p.stem == video_stem), None)
+            if matched is None:
+                print(f"Missing clusters: {item['vid_name']}")
+                missing_cluster_count += 1
+                continue
+            with open(matched, 'r') as f:
+                cluster_info = json.load(f)
+            item['clusters'] = cluster_info['clusters']
+            item['medoids'] = cluster_info['medoids']
+            kept.append(item)
+        self.data = kept
+
+        print(f"{len(self.data)} videos have cluster files.")
+        if missing_cluster_count > 0:
+            print(f"Skipped {missing_cluster_count} videos (cluster file not found).")
+
+    def _sample_indices(self, item, total_frames):
+        if self.random_segment_sample:
+            picks = [int(np.random.choice(members)) for members in item['clusters']]
+        else:
+            picks = list(item['medoids'])
+
+        # Fewer non-empty clusters than num_frames: top up by cycling through the picks.
+        target_indices = [picks[i % len(picks)] for i in range(self.num_frames)]
+        target_indices = [min(i, total_frames - 1) for i in target_indices]
+        # Sorted so the sequential OpenCV reader works properly
+        return sorted(target_indices)
 
 
 class MILVideoDatasetRope(Dataset):
@@ -340,6 +400,10 @@ class MILVideoDatasetRope(Dataset):
     @property
     def labels(self):
         return [int(item['label']) for item in self.data]
+
+    @property
+    def grades(self):
+        return [int(item['grade']) for item in self.data]
 
     def __len__(self):
         return len(self.data)

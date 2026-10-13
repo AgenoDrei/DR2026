@@ -25,6 +25,10 @@ def parse_args():
     parser.add_argument('--seg_model_dir', type=str, default='cropping/models')
     parser.add_argument('--cls_model_dir', type=str, default='informative_frames/models')
     parser.add_argument('--out_base', type=str, default='data/ensemble_results')
+    parser.add_argument('--min_informative_frames', type=int, default=32,
+                        help="Guaranteed minimum length of the cleaned clip.")
+    parser.add_argument('--infer_batch_size', type=int, default=16,
+                        help="Frames batched per ensemble forward pass in PASS 1.")
     return parser.parse_args()
 
 
@@ -69,6 +73,7 @@ def select_informative_frames(probs, start_threshold, min_threshold, step, min_f
 def main():
     args = parse_args()
     DEVICE = torch.device(f"cuda:{0}" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
 
     VIDEO_DIR = Path(args.video_dir)
     SEG_MODEL_DIR = Path(args.seg_model_dir)
@@ -86,7 +91,8 @@ def main():
     CONF_THRESHOLD = 0.5  # starting / preferred threshold
     MIN_CONF_THRESHOLD = 0.2  # floor - never go below this
     THRESHOLD_STEP = 0.05  # how much to relax the threshold per attempt
-    MIN_INFORMATIVE_FRAMES = 32  # guaranteed minimum length of the cleaned clip
+    MIN_INFORMATIVE_FRAMES = args.min_informative_frames
+    INFER_BATCH_SIZE = args.infer_batch_size
 
     # 1. Load Ensembles
     print(f"Loading 5-Fold Unet++ (B4) and Classification (B4) on {DEVICE}...")
@@ -95,12 +101,12 @@ def main():
     for fold in range(5):
         # Seg Model
         sm = smp.UnetPlusPlus(encoder_name="efficientnet-b4", in_channels=3, classes=1).to(DEVICE).eval()
-        sm.load_state_dict(torch.load(list(SEG_MODEL_DIR.glob(f"*fold_{fold}*"))[0], map_location=DEVICE))
+        sm.load_state_dict(torch.load(list(SEG_MODEL_DIR.glob(f"*fold_{fold}*.pth"))[0], map_location=DEVICE))
         seg_ensemble.append(sm)
         # Cls Model
         cm = models.efficientnet_b4()
         cm.classifier[1] = torch.nn.Linear(cm.classifier[1].in_features, 1)
-        cm.load_state_dict(torch.load(list(CLS_MODEL_DIR.glob(f"*Fold{fold}*"))[0], map_location=DEVICE))
+        cm.load_state_dict(torch.load(list(CLS_MODEL_DIR.glob(f"*Fold{fold}*.pth"))[0], map_location=DEVICE))
         cm.to(DEVICE).eval()
         cls_ensemble.append(cm)
 
@@ -136,41 +142,72 @@ def main():
         frame_results = []
         global_max_dim = 0
 
+        amp_ctx = lambda: torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda'))
+
         with tqdm(total=total_f, desc=f"Analysis: {vid_id}", leave=False) as pbar:
             f_idx = 0
             while True:
-                ret, frame = cap.read()
-                if not ret: break
+                # --- Read up to INFER_BATCH_SIZE raw frames ---
+                batch_frames = []
+                batch_f_indices = []
+                for _ in range(INFER_BATCH_SIZE):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    batch_frames.append(frame)
+                    batch_f_indices.append(f_idx)
+                    f_idx += 1
+                if not batch_frames:
+                    break
 
-                h, w = frame.shape[:2]
-                seg_in = seg_trans(image=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))['image'].unsqueeze(0).to(DEVICE)
+                h, w = batch_frames[0].shape[:2]
 
-                with torch.no_grad():
-                    # Average Mask
-                    m_preds = torch.stack([torch.sigmoid(m(seg_in)) for m in seg_ensemble])
-                    mean_mask = torch.mean(m_preds, dim=0).squeeze().cpu().numpy()
+                # --- Batched segmentation: one forward pass per ensemble member for the whole batch ---
+                seg_in = torch.stack([
+                    seg_trans(image=cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))['image'] for fr in batch_frames
+                ]).to(DEVICE)
 
-                full_mask = cv2.resize(mean_mask, (w, h))
-                clean_mask, mw, mh, cx, cy = get_largest_component_mask(full_mask > 0.5)
+                with torch.no_grad(), amp_ctx():
+                    m_preds = torch.stack([torch.sigmoid(m(seg_in)) for m in seg_ensemble])  # [5, B, 1, H, W]
+                    mean_mask_batch = torch.mean(m_preds, dim=0).squeeze(1).float().cpu().numpy()  # [B, H, W]
 
-                prob = 0.0
-                if clean_mask is not None:
-                    global_max_dim = max(global_max_dim, max(mw, mh))
-                    p = int(max(mw, mh) * 0.05)
-                    x1, y1 = int(max(0, cx - mw // 2 - p)), int(max(0, cy - mh // 2 - p))
-                    crop = frame[y1:y1 + mh + 2 * p, x1:x1 + mw + 2 * p]
+                # --- Per-frame CPU postprocessing (connected components can't batch) ---
+                per_frame_info = [(None, None, None)] * len(batch_frames)  # (clean_mask, cx, cy)
+                crops, crop_slots = [], []
 
-                    if crop.size > 0:
-                        cls_in = cls_trans(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(
-                            DEVICE)
-                        with torch.no_grad():
-                            # Average Probability
-                            c_preds = torch.stack([torch.sigmoid(m(cls_in)) for m in cls_ensemble])
-                            prob = torch.mean(c_preds).item()
+                for bi, mask_small in enumerate(mean_mask_batch):
+                    full_mask = cv2.resize(mask_small, (w, h))
+                    clean_mask, mw, mh, cx, cy = get_largest_component_mask(full_mask > 0.5)
+                    per_frame_info[bi] = (clean_mask, cx, cy)
 
-                frame_results.append({'f': f_idx, 'prob': prob, 'cx': cx, 'cy': cy, 'mask': clean_mask})
-                f_idx += 1
-                pbar.update(1)
+                    if clean_mask is not None:
+                        global_max_dim = max(global_max_dim, max(mw, mh))
+                        # Masked square crop, same recipe as crop_frames.py (classifier training data)
+                        masked = cv2.bitwise_and(batch_frames[bi], batch_frames[bi], mask=clean_mask)
+                        crop = crop_and_pad(masked, cx, cy, int(max(mw, mh) * 1.05))
+
+                        if crop.size > 0:
+                            crops.append(cls_trans(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))))
+                            crop_slots.append(bi)
+
+                # --- Batched classification on whichever frames produced a valid crop ---
+                probs = [0.0] * len(batch_frames)
+                if crops:
+                    cls_in = torch.stack(crops).to(DEVICE)
+                    with torch.no_grad(), amp_ctx():
+                        c_preds = torch.stack([torch.sigmoid(m(cls_in)) for m in cls_ensemble])  # [5, Bc, 1]
+                        mean_probs = torch.mean(c_preds, dim=0).squeeze(1).float().cpu().numpy()  # [Bc]
+                    for slot_idx, bi in enumerate(crop_slots):
+                        probs[bi] = float(mean_probs[slot_idx])
+
+                for bi in range(len(batch_frames)):
+                    clean_mask, cx, cy = per_frame_info[bi]
+                    frame_results.append({
+                        'f': batch_f_indices[bi], 'prob': probs[bi], 'cx': cx, 'cy': cy,
+                        'mask': clean_mask, 'frame': batch_frames[bi],
+                    })
+
+                pbar.update(len(batch_frames))
 
         # --- Adaptive informative-frame selection ---
         # Start at CONF_THRESHOLD and relax down to MIN_CONF_THRESHOLD until we
@@ -201,20 +238,14 @@ def main():
                 (final_sz, final_sz)
             )
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
             for res in frame_results:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
                 # Skip frames that didn't make the informative cut
                 if res['f'] not in informative_idx_set:
                     continue
 
                 # If segmentation exists, crop around it
                 if res['mask'] is not None:
-                    masked = cv2.bitwise_and(frame, frame, mask=res['mask'])
+                    masked = cv2.bitwise_and(res['frame'], res['frame'], mask=res['mask'])
                     cropped = crop_and_pad(
                         masked,
                         res['cx'],

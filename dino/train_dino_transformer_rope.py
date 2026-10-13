@@ -205,6 +205,7 @@ class DinoSelfAttention(nn.Module):
             rope_base=10_000,
             rope_position_scale=None,
             num_frames=32,
+            num_classes=1,
             classifier_checkpoint_path=None,
             full_checkpoint_path=None,
     ):
@@ -259,6 +260,7 @@ class DinoSelfAttention(nn.Module):
         self.use_pos_embedding = use_pos_embedding
         self.use_rope = use_rope
         self.num_frames = num_frames
+        self.num_classes = num_classes
         # Continuous [0, 1] frame positions are scaled up to roughly the
         # same numeric range as standard integer RoPE positions (0..num_frames-1)
         # so that the default base=10_000 hyperparameter stays meaningful.
@@ -308,7 +310,7 @@ class DinoSelfAttention(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, 1)
+            nn.Linear(256, num_classes)
         )
 
         self._init_weights()
@@ -324,6 +326,11 @@ class DinoSelfAttention(nn.Module):
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        else:
+            # Fine-tuning the full backbone over a 32-frame bag is otherwise
+            # too memory-hungry for a 24GB GPU; recompute activations during
+            # backward instead of storing them (only engages in train mode).
+            self.backbone.grad_checkpointing = True
 
     def _load_classifier_backbone(self, path):
         """Load only the backbone weights from a DinoClassifier checkpoint.
@@ -488,12 +495,13 @@ def train_self_attention(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    timestamp = datetime.now().strftime('%m%d_%H%M')
-    run_name = (f"dino_sa"
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    description = (f"dino_sa"
+                f"_{"binary" if args.binary_classification else "all"}"
                 f"_{args.split_path.split('/')[-1]}"
-                f"_{timestamp}"
                 f"{f"_rope_{args.rope_base}_{args.rope_position_scale}" if args.use_rope else ""}"
                 f"{"_posEmb" if args.use_pos_embedding else ""}")
+    run_name = f"{timestamp}_{description}" + (f"_{args.run_tag}" if args.run_tag else "")
 
     run_dir = os.path.join("transformer", "models", run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -509,7 +517,8 @@ def train_self_attention(args):
                               use_pos_embedding=args.use_pos_embedding,
                               use_rope=args.use_rope,
                               rope_base=args.rope_base,
-                              rope_position_scale=args.rope_position_scale).to(device)
+                              rope_position_scale=args.rope_position_scale,
+                              num_classes=1 if args.binary_classification else 5).to(device)
 
     # --- Transforms ---
     train_trans = make_train_transform_dino(args.img_size, args.complex_augs)
@@ -544,14 +553,17 @@ def train_self_attention(args):
                                  search_dir_paths=search_dir_paths)
 
     # --- Setup Oversampling ---
-    train_labels = np.array(train_ds.labels)
-    class_counts = np.bincount(train_labels)
+    if args.binary_classification:
+        train_targets = np.array(train_ds.labels)
+    else:
+        train_targets = np.array(train_ds.grades)
+    class_counts = np.bincount(train_targets)
 
     # Compute inverse class frequencies
     class_weights = 1.0 / class_counts
 
     # Map each video in the dataset to its class weight
-    sample_weights = class_weights[train_labels]
+    sample_weights = class_weights[train_targets]
     sample_weights = torch.from_numpy(sample_weights).double()
 
     sampler = WeightedRandomSampler(
@@ -569,48 +581,58 @@ def train_self_attention(args):
     )
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss() if args.binary_classification else nn.CrossEntropyLoss()
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
+    # Mixed precision: fine-tuning the full (unfrozen) ViT-L backbone over a
+    # 32-frame bag in fp32 exceeds 24GB. autocast + GradScaler cuts
+    # activation memory substantially without changing the training config.
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    best_pr_auc = 0.0
+    best_selection_metric = 0.0
 
     print(f"Starting Self-Attention Training: {run_name}")
 
     for epoch in range(args.epochs):
-        t_loss = train_one_epoch_trans_rope(model, train_loader, criterion, optimizer, device)
-        m = validate_extended_trans_rope(model, val_loader, criterion, device)
+        t_loss = train_one_epoch_trans_rope(model, train_loader, criterion, optimizer, args.binary_classification, device, scaler)
+        m = validate_extended_trans_rope(model, val_loader, criterion, args.binary_classification, device)
 
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
         # Save confusion matrix
-        save_confusion_matrix(m['y_true'], m['y_pred'], epoch, run_dir)
+        class_names = ['non-referable', 'referable'] if args.binary_classification else ['0', '1', '2', '3', '4']
+        save_confusion_matrix(m['y_true'], m['y_pred'], epoch, run_dir, class_names=class_names)
 
         # Save best model
-        if m['pr_auc'] > best_pr_auc:
-            best_pr_auc = m['pr_auc']
+        selection_metric = m['qwk'] if not args.binary_classification else m['pr_auc']
+        if selection_metric > best_selection_metric:
+            best_selection_metric = selection_metric
             torch.save(model.state_dict(), os.path.join(run_dir, "best_sa_model.pth"))
+            writer.add_scalar('Meta/Best_Selection_Metric', best_selection_metric, epoch)
 
         writer.add_scalar('Meta/Learning_Rate', current_lr, epoch)
 
         writer.add_scalar('Loss/train', t_loss, epoch)
         writer.add_scalar('Loss/val', m['loss'], epoch)
 
-        writer.add_scalar('Metric/Accuracy', m['acc'], epoch)
-        writer.add_scalar('Metric/F1', m['f1'], epoch)
-        writer.add_scalar('Metric/Precision', m['precision'], epoch)
-        writer.add_scalar('Metric/Recall', m['recall'], epoch)
-        writer.add_scalar('Metric/PR_AUC', m['pr_auc'], epoch)
-        writer.add_scalar('Metric/ROC_AUC', m['roc_auc'], epoch)
+        skip_keys = {'loss', 'y_true', 'y_pred'}
+        for key, value in m.items():
+            if key in skip_keys:
+                continue
+            writer.add_scalar(f'Metric/{key}', value, epoch)
 
+        f1_headline = m['f1'] if args.binary_classification else m['f1_macro']
+        headline_metric_name = 'PR-AUC' if args.binary_classification else 'QWK'
+        headline_metric_value = m['pr_auc'] if args.binary_classification else m['qwk']
         print(
             f"Epoch {epoch} | "
             f"LR: {current_lr:.6f} | "
             f"Loss: {t_loss:.3f} | "
+            f"Val Loss: {m['loss']:.3f} | "
             f"Acc: {m['acc']:.3f} | "
-            f"F1: {m['f1']:.3f} | "
-            f"PR-AUC: {m['pr_auc']:.3f}"
+            f"F1: {f1_headline:.3f} | "
+            f"{headline_metric_name}: {headline_metric_value:.3f}"
         )
 
     writer.close()
@@ -640,6 +662,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_blocks', type=int, default=1)
     parser.add_argument('--random_segment_sample', action='store_true')
     parser.add_argument('--fused_dataset', action='store_true')
+    parser.add_argument('--binary_classification', action='store_true')
+    parser.add_argument('--run_tag', type=str, default=None,
+                        help='Optional short suffix appended to the run name (e.g. an experiment label).')
 
     args = parser.parse_args()
 

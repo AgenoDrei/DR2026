@@ -1,19 +1,15 @@
 dataset.py: Contains the dataset classes used in the whole project
 
-match_clips.py: Save in matching_results_hd.json the connection between the selected frames from Simon to the available videos;
+match_clips.py: Matches frames in FRAME_DIRS with video (clips) in CLIP_DIRS; saved into matching_results_{}.json.
 We need this later to create a consistent dataset split for both the frame-based and video-based models
 
-match_grades.py: Use matching_results_hd.json and the official grading in DR_Grading_Summary_v3.csv to extract the grading;
-saved into final_clip_labels_hd.json and final_image_labels_hd.json
+match_grades.py: Use matching_results_{}.json and the official grading in DR_Grading_Summary_v3.csv to extract the grading;
+saved into clip_labels_{}.json and image_labels_{}.json
 
-match_grades_remaining.py: Use matching_results_hd.json and the official grading in DR_Grading_Summary_v3.csv to
-find the grades of the videos that have no corresponding images. The idea is that we could use them for the video-based
-evaluation. But at the moment they are not used to allow a more straightforward comparison between image-based and
-video-based evaluation. Also, at some point we will probably get new videos and a new annotation file, so might not
-worth the struggle
+split_data.py: Create stratified split (original 5 grades) video-based with clip_labels_{}.json and get the frame-based split
+using matching_results_{}.json. The split is 0.8 to 0.2 video-wise and only approximately 0.8 to 0.2 frame-wise.
 
-split_data.py: Create stratified split (original 5 grades) video-based with final_clip_labels_hd.json and get the frame-based split
-using matching_results_hd.json. The split is 0.8 to 0.2 video-wise and only approximately 0.8 to 0.2 frame-wise.
+------------------------------------------------------------------------------------------------------------------------------
 
 Removed IMG_2581.mp4 from sciebo because 'IMG_2581 LE MILD NPDR.mp4' is the non-downscaled version (duplicate)
 Removed duplicate of 'IMG_2502 RE NO DR CHANGES.mp4' (there was the same video again but with an additional space in the name)

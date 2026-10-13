@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 
 VIDEO_DIR = Path('data/dr_videos')
-# VIDEO_DIR = Path('experiments/Paxos_2020/data')
+# VIDEO_DIR = Path('/home/user/mueller9/Data/2020_Paxos_Videos/data')
 OUTPUT_DIR = Path('cropping/frames_to_annotate_larger')
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -24,7 +24,7 @@ def pad_to_square(image):
 
 def extract_and_pad_sequential():
     print(f"Searching for videos in: {VIDEO_DIR.resolve()}")
-    video_files = list(VIDEO_DIR.glob('*.mp4'))
+    video_files = list(VIDEO_DIR.glob('*.mp4')) + list(VIDEO_DIR.glob('*.MOV')) + list(VIDEO_DIR.glob('*.mov'))
 
     if not video_files:
         print(f"Error: No videos found at {VIDEO_DIR}")

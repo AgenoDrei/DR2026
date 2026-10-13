@@ -5,8 +5,7 @@ classifier/models/
 cropping/frames_to_annotate_larger/
 cropping/models/
 data/2024_Paxos_Frames/
-data/ensemble_results_paxos2020/
-data/ensemble_results_paxos2025/
+data/ensemble_results_*/
 data/informative_frames/
 data/stratified_splits/split_*/
 data/matched_frames/
@@ -18,3 +17,10 @@ transformer/models/
 *.pt
 *.pth
 *.ckpt
+convnext/models/
+convnext/logs/
+runs/
+CLAUDE.md
+.vscode/
+__pycache__/
+*.log
