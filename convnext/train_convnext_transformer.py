@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from data.dataset import MILVideoDataset
+from data.dataset import MILVideoDataset, MILVideoDatasetCluster
 from dino.utils import make_train_transform_dino, make_val_transform_dino
 from misc.utils import save_confusion_matrix
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
@@ -30,7 +30,8 @@ def train_convnext_transformer(args):
                 f"{"binary" if args.binary_classification else "all"}_"
                 f"{args.split_path.split('/')[-1]}_"
                 f"{args.adapter}"
-                f"{f'_{args.aggregation_mode}' if args.aggregation_mode != 'cls' else ''}")
+                f"{f'_{args.aggregation_mode}' if args.aggregation_mode != 'cls' else ''}"
+                f"{'_cluster' if args.cluster_sample else ''}")
     run_name = (f"{timestamp}_{description}"
                 f"{f'_{args.run_tag}' if args.run_tag else ''}")
 
@@ -83,15 +84,27 @@ def train_convnext_transformer(args):
     val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
 
     # --- Datasets ---
-    train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
-                               num_frames=args.num_frames,
-                               transform=train_trans,
-                               random_segment_sample=args.random_segment_sample,
-                               search_dir_paths=search_dir_paths)
-    val_ds = MILVideoDataset(os.path.join(args.split_path, args.val_json),
-                             num_frames=args.num_frames,
-                             transform=val_trans,
-                             search_dir_paths=search_dir_paths)
+    if args.cluster_sample:
+        # One random frame per cluster for training, cluster medoids for validation
+        train_ds = MILVideoDatasetCluster(os.path.join(args.split_path, args.train_json),
+                                          num_frames=args.num_frames,
+                                          transform=train_trans,
+                                          random_segment_sample=True,
+                                          search_dir_paths=search_dir_paths)
+        val_ds = MILVideoDatasetCluster(os.path.join(args.split_path, args.val_json),
+                                        num_frames=args.num_frames,
+                                        transform=val_trans,
+                                        search_dir_paths=search_dir_paths)
+    else:
+        train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
+                                   num_frames=args.num_frames,
+                                   transform=train_trans,
+                                   random_segment_sample=args.random_segment_sample,
+                                   search_dir_paths=search_dir_paths)
+        val_ds = MILVideoDataset(os.path.join(args.split_path, args.val_json),
+                                 num_frames=args.num_frames,
+                                 transform=val_trans,
+                                 search_dir_paths=search_dir_paths)
 
     # --- Setup Oversampling ---
     if args.binary_classification:
@@ -117,19 +130,12 @@ def train_convnext_transformer(args):
     backbone_param_ids = {id(p) for p in model.backbone.parameters()}
     head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in backbone_param_ids]
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-
-    # Warmup: keep the backbone frozen for the first --freeze_epochs epochs so the
-    # randomly initialised head settles before its gradients reach the backbone.
-    # The backbone stays in the optimizer; frozen params just get no gradients.
-    if args.freeze_epochs > 0 and backbone_params:
-        for p in backbone_params:
-            p.requires_grad = False
-        print(f"Backbone frozen for the first {args.freeze_epochs} epoch(s).")
     param_groups = [{"params": head_params, "lr": args.lr}]
     if backbone_params:
         param_groups.append({"params": backbone_params, "lr": args.lr * args.backbone_lr_mult})
     optimizer = optim.Adam(param_groups, lr=args.lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
+    # Cosine decay per epoch from the starting LRs down to min_lr (applies to both param groups).
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # -inf (not 0.0) so a checkpoint is always written, even if QWK stays <= 0.
@@ -139,11 +145,6 @@ def train_convnext_transformer(args):
     print(f"Starting ConvNeXt Self-Attention Training: {run_name}")
 
     for epoch in range(args.epochs):
-        if args.freeze_epochs > 0 and backbone_params and epoch == args.freeze_epochs:
-            for p in backbone_params:
-                p.requires_grad = True
-            print(f"Epoch {epoch}: unfreezing backbone (lr {optimizer.param_groups[1]['lr']:.2e}).")
-
         # No attention-entropy loss term for this experiment; entropy is only logged.
         t_loss, t_attn_entropy = train_one_epoch_trans(
             model, train_loader, criterion, optimizer, args.binary_classification, device, scaler,
@@ -151,13 +152,13 @@ def train_convnext_transformer(args):
         )
         m = validate_extended_trans(model, val_loader, criterion, args.binary_classification, device)
 
+        selection_metric = m['qwk'] if not args.binary_classification else m['pr_auc']
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
         class_names = ['non-referable', 'referable'] if args.binary_classification else ['0', '1', '2', '3', '4']
         save_confusion_matrix(m['y_true'], m['y_pred'], epoch, run_dir, class_names=class_names)
 
-        selection_metric = m['qwk'] if not args.binary_classification else m['pr_auc']
         if selection_metric > best_selection_metric:
             best_selection_metric = selection_metric
             best_metrics = {k: v for k, v in m.items() if k not in ('y_true', 'y_pred')}
@@ -206,16 +207,14 @@ if __name__ == "__main__":
     parser.add_argument('--train_json', type=str, default="mil_train.json")
     parser.add_argument('--val_json', type=str, default="mil_val.json")
     parser.add_argument('--freeze_backbone', action='store_true')
-    parser.add_argument('--freeze_epochs', type=int, default=0,
-                        help='Keep the backbone frozen for this many initial epochs, then fine-tune it '
-                             '(ignored with --freeze_backbone).')
     parser.add_argument('--no_grad_checkpointing', action='store_true',
                         help='Disable per-block checkpointing of the unfrozen ConvNeXt backbone.')
     parser.add_argument('--epochs', type=int, default=12)
-    parser.add_argument('--lr_step', type=int, default=6)
+    parser.add_argument('--min_lr', type=float, default=1e-7,
+                        help='Final LR of the cosine schedule (reached after --epochs).')
     parser.add_argument('--img_size', type=int, default=512)
-    parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--backbone_lr_mult', type=float, default=0.3,
+    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--backbone_lr_mult', type=float, default=0.1,
                         help='Backbone LR = --lr * this (only matters when --freeze_backbone is omitted).')
     parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--no_feature_standardization', action='store_true',
@@ -236,8 +235,12 @@ if __name__ == "__main__":
                         help='Distance-Scaled CE weight: loss *= 1 + w*|pred_grade-true_grade| (5-class only). 0 disables.')
     parser.add_argument('--random_segment_sample', action='store_true')
     parser.add_argument('--fused_dataset', action='store_true')
+    parser.add_argument('--cluster_sample', action='store_true',
+                        help='Sample one frame per k-means cluster (clustering/cluster_frames.py) instead of by time; Paxos2025 only.')
     parser.add_argument('--binary_classification', action='store_true')
 
     args = parser.parse_args()
+    if args.cluster_sample and args.fused_dataset:
+        parser.error('--cluster_sample only has cluster files for Paxos2025, not --fused_dataset')
 
     train_convnext_transformer(args)

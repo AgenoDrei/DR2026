@@ -313,7 +313,7 @@ def train_self_attention(args):
                 f"{args.split_path.split('/')[-1]}_"
                 f"{"full" if args.train_json == "mil_train.json" else args.train_json.split(".")[0].split("_")[-1]}"
                 f"{f'_{args.aggregation_mode}' if args.aggregation_mode != 'cls' else ''}"
-                f"{'_cluster' if args.cluster_sample else ''}")
+                f"{'_cluster' if getattr(args, 'cluster_sample', False) else ''}")
     run_name = (f"{timestamp}_{description}"
                 f"{f'_{args.run_tag}' if args.run_tag else ''}")
 
@@ -358,7 +358,7 @@ def train_self_attention(args):
     else:
         search_dir_paths = ["data/ensemble_results_paxos2025/cleaned_videos"]
 
-    if args.cluster_sample:
+    if getattr(args, 'cluster_sample', False):
         # One random frame per cluster for training, cluster medoids for validation
         train_ds = MILVideoDatasetCluster(os.path.join(args.split_path, args.train_json),
                                           num_frames=args.num_frames,
@@ -420,7 +420,10 @@ def train_self_attention(args):
     param_groups = [{"params": head_params, "lr": args.lr}]
     if backbone_params:
         param_groups.append({"params": backbone_params, "lr": args.lr * args.backbone_lr_mult})
-    optimizer = optim.Adam(param_groups, lr=args.lr)
+    if getattr(args, 'optimizer', 'adam') == 'adamw':
+        optimizer = optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.Adam(param_groups, lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
     # Mixed precision: an unfrozen ViT-L backbone over a frame bag in fp32
     # exceeds 24GB; autocast + GradScaler cuts activation memory.
@@ -500,6 +503,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr_step', type=int, default=10)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='Only used with --optimizer adamw (decoupled weight decay).')
     parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--use_pos_embedding', action='store_true')
     parser.add_argument('--num_blocks', type=int, default=2)
@@ -518,7 +524,7 @@ if __name__ == "__main__":
                         help='Backbone LR = --lr * this (only matters when --freeze_backbone is omitted).')
     parser.add_argument('--attn_entropy_weight', type=float, default=0.0,
                         help='Entropy-minimization weight on CLS->frame attention (peakier attention). 0 disables.')
-    parser.add_argument('--distance_scale_weight', type=float, default=0.0,
+    parser.add_argument('--distance_scale_weight', type=float, default=0.2,
                         help='Distance-Scaled CE weight: loss *= 1 + w*|pred_grade-true_grade| (5-class only). 0 disables.')
     parser.add_argument('--random_segment_sample', action='store_true')
     parser.add_argument('--fused_dataset', action='store_true')

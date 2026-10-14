@@ -13,3 +13,25 @@ DINOv3 ConvNeXt-L backbone + same transformer head as dino/train_dino_transforme
 - generic ConvNeXt features: cos sim between videos ~0.94 (one shared direction), but a standardized logistic-regression probe on GAP features gets val QWK ~0.78
 - fix: per-channel standardization of the feature map with train-set stats (feat_mean/feat_std buffers)
 - head-only tests on cached frozen features: lr 3e-4 always collapses (even with grad clipping), lr 1e-4 seed-dependent (0.56-0.77), lr 5e-5/3e-5 standardized stable (~0.80-0.82); distance scaling no clear effect; linear_mean ~ linear_attnpool
+- warmup (backbone frozen 3 epochs, then x0.3 = 1.5e-5): QWK 0.64 -> 0.000 within the first unfrozen epoch, train loss back to start level; never recovered. Unfreezing itself breaks the features, not the random head. --freeze_epochs removed again.
+- frozen backbone, standardized, lr 5e-5 (full run, 8 epochs): best val QWK 0.758 (epoch 5), final 0.704
+- warmup (backbone frozen 3 epochs, then x0.3 = 1.5e-5): QWK 0.64 -> 0.000 within the first unfrozen epoch, train loss back to start level; never recovered. Unfreezing itself breaks the features, not the random head. --freeze_epochs removed again.
+- frozen backbone, standardized, lr 5e-5 (full run, 8 epochs): best val QWK 0.758 (epoch 5), final 0.704
+- unfreeze diagnostic (from best frozen ckpt, head 5e-5 / backbone 1.5e-5 Adam, logs convnext/logs/unfreeze_diag_*.log):
+  within 50 steps (backbone weights changed only ~0.2%) the raw backbone features drift by ~2x their own norm and
+  all videos map to the same adapter vector (cos sim 0.66 -> 1.00), probe preds one grade. Same with std clamped
+  at its median, with layer-scale gammas frozen, and in fp32 -> not standardization, not gamma, not fp16.
+  feat_std range is only 0.35-3.0 (median 0.76), no tiny-std channels.
+- LR schedule switched from StepLR (--lr_step) to per-epoch cosine annealing down to --min_lr (default 1e-7), applied to both head and backbone groups
+
+2026-10-14 linear_mean, backbone unfrozen x0.1 (first unfrozen runs that didn't collapse), Paxos2025 split_1 (same videos as stratified_splits_paxos2025/split_1):
+- std on, lr 5e-5, 12 ep StepLR(6):          best QWK 0.864 (ep 10), ref recall 0.788; last 0.859
+- std off, lr 5e-5, 12 ep StepLR(6):         best QWK 0.830 (ep 11), ref recall 0.848; QWK 0 for epochs 0-4, then recovered
+- std off, lr 1e-5, 18 ep cosine to 1e-7:    best QWK 0.848 (ep 15), ref recall 0.818; last 0.840; smoother, no collapse phase
+- standardization is not strictly required: it gives a faster/more stable start, but unstandardized runs recover
+- --cluster_sample added (same as dino/train_dino_transformer.py: train = random member per k-means cluster, val = medoids; Paxos2025 only)
+
+2026-10-14 linear_mean, unfrozen backbone x0.1 (all Paxos2025 split_1, same 60 val videos as the ViT baseline):
+- standardized, lr 5e-5, StepLR@6, 12 ep: best QWK 0.864 (ep 10, ref recall 0.788), final 0.859  <- best ConvNeXt so far
+- no standardization, lr 5e-5, StepLR@6, 12 ep: one grade for ep 0-4, then recovers; best 0.830 (ep 11, ref recall 0.848)
+- no standardization, lr 1e-5, cosine to 1e-7, 18 ep: learns from ep 1; best 0.848 (ep 15, ref recall 0.818), ep 12-17 stable 0.82-0.85
