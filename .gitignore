@@ -24,3 +24,4 @@ CLAUDE.md
 .vscode/
 __pycache__/
 *.log
+dino/logs/

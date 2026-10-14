@@ -1,51 +1,30 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
 import os
 import json
-import random
 import argparse
-import numpy as np
-from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from data.dataset import MILVideoDataset, MILVideoDatasetCluster
 from dino.utils import make_train_transform_dino, make_val_transform_dino
-from misc.utils import save_confusion_matrix
+from misc.training import (seed_everything, make_run_dir, video_search_dirs, make_balanced_loaders,
+                           make_optimizer, EpochLogger)
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
 from .model import ConvNextSelfAttention, ADAPTERS
 
 
 def train_convnext_transformer(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(args.seed)
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
     description = (f"convnext_sa_"
                 f"{"binary" if args.binary_classification else "all"}_"
                 f"{args.split_path.split('/')[-1]}_"
                 f"{args.adapter}"
                 f"{f'_{args.aggregation_mode}' if args.aggregation_mode != 'cls' else ''}"
                 f"{'_cluster' if args.cluster_sample else ''}")
-    run_name = (f"{timestamp}_{description}"
-                f"{f'_{args.run_tag}' if args.run_tag else ''}")
-
-    run_dir = os.path.join("convnext", "models", run_name)
-    os.makedirs(run_dir, exist_ok=True)
-
-    writer = SummaryWriter(log_dir=os.path.join("runs", run_name))
-    writer.add_text("args", str(args))
-
-    # --- Dataset dirs ---
-    if args.fused_dataset:
-        search_dir_paths = ["data/ensemble_results_paxos2025/cleaned_videos", "data/ensemble_results_paxos2020/cleaned_videos"]
-    else:
-        search_dir_paths = ["data/ensemble_results_paxos2025/cleaned_videos"]
+    run_name, run_dir = make_run_dir("convnext", description, args.run_tag)
+    search_dir_paths = video_search_dirs(args.fused_dataset)
 
     # --- Model ---
     # Saved as a sidecar so ConvNextSelfAttention.from_checkpoint can rebuild it.
@@ -79,69 +58,30 @@ def train_convnext_transformer(args):
         print("Fitting backbone feature standardization on the training videos...")
         model.fit_feature_stats((stats_ds[i][0] for i in range(len(stats_ds))), device)
 
-    # --- Transforms ---
+    # --- Data ---
     train_trans = make_train_transform_dino(args.img_size, args.complex_augs)
     val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
-
-    # --- Datasets ---
-    if args.cluster_sample:
-        # One random frame per cluster for training, cluster medoids for validation
-        train_ds = MILVideoDatasetCluster(os.path.join(args.split_path, args.train_json),
-                                          num_frames=args.num_frames,
-                                          transform=train_trans,
-                                          random_segment_sample=True,
-                                          search_dir_paths=search_dir_paths)
-        val_ds = MILVideoDatasetCluster(os.path.join(args.split_path, args.val_json),
-                                        num_frames=args.num_frames,
-                                        transform=val_trans,
-                                        search_dir_paths=search_dir_paths)
-    else:
-        train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
-                                   num_frames=args.num_frames,
-                                   transform=train_trans,
-                                   random_segment_sample=args.random_segment_sample,
-                                   search_dir_paths=search_dir_paths)
-        val_ds = MILVideoDataset(os.path.join(args.split_path, args.val_json),
-                                 num_frames=args.num_frames,
-                                 transform=val_trans,
-                                 search_dir_paths=search_dir_paths)
-
-    # --- Setup Oversampling ---
-    if args.binary_classification:
-        train_targets = np.array(train_ds.labels)
-    else:
-        train_targets = np.array(train_ds.grades)
-    class_counts = np.bincount(train_targets)
-    class_weights = 1.0 / class_counts
-    sample_weights = torch.from_numpy(class_weights[train_targets]).double()
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=1, sampler=sampler, shuffle=False)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    # Cluster sampling: one random frame per cluster for training, cluster medoids for validation.
+    dataset_cls = MILVideoDatasetCluster if args.cluster_sample else MILVideoDataset
+    train_ds = dataset_cls(os.path.join(args.split_path, args.train_json),
+                           num_frames=args.num_frames,
+                           transform=train_trans,
+                           random_segment_sample=args.cluster_sample or args.random_segment_sample,
+                           search_dir_paths=search_dir_paths)
+    val_ds = dataset_cls(os.path.join(args.split_path, args.val_json),
+                         num_frames=args.num_frames,
+                         transform=val_trans,
+                         search_dir_paths=search_dir_paths)
+    train_loader, val_loader = make_balanced_loaders(train_ds, val_ds, args.binary_classification)
 
     criterion = nn.BCEWithLogitsLoss() if args.binary_classification else nn.CrossEntropyLoss()
-
     # Head + adapter at lr (param_groups[0], used for LR logging), backbone at lr * backbone_lr_mult.
-    backbone_param_ids = {id(p) for p in model.backbone.parameters()}
-    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in backbone_param_ids]
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-    param_groups = [{"params": head_params, "lr": args.lr}]
-    if backbone_params:
-        param_groups.append({"params": backbone_params, "lr": args.lr * args.backbone_lr_mult})
-    optimizer = optim.Adam(param_groups, lr=args.lr)
+    optimizer = make_optimizer(model, args.lr, args.backbone_lr_mult)
     # Cosine decay per epoch from the starting LRs down to min_lr (applies to both param groups).
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # -inf (not 0.0) so a checkpoint is always written, even if QWK stays <= 0.
-    best_selection_metric = float("-inf")
-    best_metrics = None
-
+    logger = EpochLogger(run_name, run_dir, args, args.binary_classification, "best_sa_model.pth")
     print(f"Starting ConvNeXt Self-Attention Training: {run_name}")
 
     for epoch in range(args.epochs):
@@ -151,50 +91,11 @@ def train_convnext_transformer(args):
             entropy_weight=0.0, distance_scale_weight=args.distance_scale_weight,
         )
         m = validate_extended_trans(model, val_loader, criterion, args.binary_classification, device)
-
-        selection_metric = m['qwk'] if not args.binary_classification else m['pr_auc']
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+        logger.log_epoch(epoch, model, optimizer, t_loss, m, {'Meta/Attn_Entropy_Train': t_attn_entropy})
 
-        class_names = ['non-referable', 'referable'] if args.binary_classification else ['0', '1', '2', '3', '4']
-        save_confusion_matrix(m['y_true'], m['y_pred'], epoch, run_dir, class_names=class_names)
-
-        if selection_metric > best_selection_metric:
-            best_selection_metric = selection_metric
-            best_metrics = {k: v for k, v in m.items() if k not in ('y_true', 'y_pred')}
-            torch.save(model.state_dict(), os.path.join(run_dir, "best_sa_model.pth"))
-            writer.add_scalar('Meta/Best_Selection_Metric', best_selection_metric, epoch)
-
-        writer.add_scalar('Meta/Learning_Rate', current_lr, epoch)
-        if len(optimizer.param_groups) > 1:
-            writer.add_scalar('Meta/Backbone_Learning_Rate', optimizer.param_groups[1]['lr'], epoch)
-
-        writer.add_scalar('Loss/train', t_loss, epoch)
-        writer.add_scalar('Loss/val', m['loss'], epoch)
-        writer.add_scalar('Meta/Attn_Entropy_Train', t_attn_entropy, epoch)
-
-        skip_keys = {'loss', 'y_true', 'y_pred'}
-        for key, value in m.items():
-            if key in skip_keys:
-                continue
-            writer.add_scalar(f'Metric/{key}', value, epoch)
-
-        f1_headline = m['f1'] if args.binary_classification else m['f1_macro']
-        headline_metric_name = 'PR-AUC' if args.binary_classification else 'QWK'
-        headline_metric_value = m['pr_auc'] if args.binary_classification else m['qwk']
-        print(
-            f"Epoch {epoch} | "
-            f"LR: {current_lr:.6f} | "
-            f"Loss: {t_loss:.3f} | "
-            f"Val Loss: {m['loss']:.3f} | "
-            f"Acc: {m['acc']:.3f} | "
-            f"F1: {f1_headline:.3f} | "
-            f"{headline_metric_name}: {headline_metric_value:.3f}"
-        )
-
-    writer.close()
-    print(f"Done. Run directory: {run_dir}")
-    return run_name, best_selection_metric, best_metrics
+    logger.close()
+    return run_name, logger.best_selection_metric, logger.best_metrics
 
 
 if __name__ == "__main__":

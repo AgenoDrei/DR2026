@@ -1,11 +1,9 @@
-import json
-import os
-
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from dino.train_dino_transformer import TransformerBlock
+from dino.utils import freeze_module
+from transformer.model import BagTransformer
 
 
 CONVNEXT_WEIGHTS = "dino/dinov3_convnext_large_pretrain_lvd1689m-61fa432d.pth"
@@ -71,14 +69,14 @@ def build_adapter(name, in_ch, dim):
     return ADAPTERS[name](in_ch, dim)
 
 
-class ConvNextSelfAttention(nn.Module):
+class ConvNextSelfAttention(BagTransformer):
     """DINOv3 ConvNeXt-L backbone -> adapter (feature map -> one vector per
-    frame) -> the same frame-level transformer head as
-    dino.train_dino_transformer.DinoSelfAttention. No temporal encoding.
+    frame) -> the same BagTransformer head as DinoSelfAttention, plus a final
+    LayerNorm. No temporal encoding.
 
     backbone_weights=None builds the backbone with random init (smoke tests);
     full_checkpoint_path loads a full ConvNextSelfAttention state dict
-    strictly (architecture must match)."""
+    strictly (architecture must match; prefer from_checkpoint(run_dir))."""
 
     def __init__(
             self,
@@ -99,15 +97,7 @@ class ConvNextSelfAttention(nn.Module):
     ):
         super().__init__()
 
-        if aggregation_mode not in ("cls", "cls_mean", "multi_token"):
-            raise ValueError(f"Unknown aggregation_mode: {aggregation_mode}")
-
-        self.num_blocks = num_blocks
-        self.num_frames = num_frames
-        self.num_classes = num_classes
         self.adapter_name = adapter
-        self.aggregation_mode = aggregation_mode
-        self.num_query_tokens = num_query_tokens if aggregation_mode == "multi_token" else 1
         self.grad_checkpointing = grad_checkpointing and not freeze_backbone
 
         if backbone_weights is not None and full_checkpoint_path is None:
@@ -129,79 +119,19 @@ class ConvNextSelfAttention(nn.Module):
         self.register_buffer("feat_std", torch.ones(C))
 
         self.adapter = build_adapter(adapter, C, adapter_dim)
-        self.L = adapter_dim
-
-        self.cls_token = nn.Parameter(torch.zeros(1, self.num_query_tokens, self.L))
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(self.L, num_heads=num_heads, ffn_dim=ffn_dim, dropout=dropout)
-            for _ in range(num_blocks)
-        ])
         # Final norm of the pre-norm stack (as in ViT), before the classifier reads the tokens.
-        self.final_norm = nn.LayerNorm(self.L)
-
-        if self.aggregation_mode == "cls_mean":
-            classifier_in_dim = 2 * self.L
-        elif self.aggregation_mode == "multi_token":
-            classifier_in_dim = self.num_query_tokens * self.L
-        else:
-            classifier_in_dim = self.L
-
-        self.classifier = nn.Sequential(
-            nn.Linear(classifier_in_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)
-        )
-
-        self._init_weights()
-
-        if full_checkpoint_path is not None:
-            print(f"Loading full ConvNextSelfAttention checkpoint: {full_checkpoint_path}")
-            state_dict = torch.load(full_checkpoint_path, map_location="cpu")
-            self.load_state_dict(state_dict, strict=True)
-
-        if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-
-    @classmethod
-    def from_checkpoint(cls, run_dir, checkpoint_name="best_sa_model.pth",
-                        config_name="architecture_config.json"):
-        """Rebuild a model from a run_dir written by train_convnext_transformer."""
-        with open(os.path.join(run_dir, config_name), "r") as f:
-            config = json.load(f)
-        return cls(full_checkpoint_path=os.path.join(run_dir, checkpoint_name), **config)
-
-    def _init_weights(self):
-        for layer in self.classifier:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.constant_(layer.bias, 0)
-
-        for block in self.blocks:
-            for layer in block.ffn:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    if layer.bias is not None:
-                        nn.init.constant_(layer.bias, 0)
-
-            nn.init.xavier_uniform_(block.mha.in_proj_weight)
-            if block.mha.in_proj_bias is not None:
-                nn.init.constant_(block.mha.in_proj_bias, 0)
-            nn.init.xavier_uniform_(block.mha.out_proj.weight)
-            if block.mha.out_proj.bias is not None:
-                nn.init.constant_(block.mha.out_proj.bias, 0)
-
-        nn.init.normal_(self.cls_token, std=1e-6)
-
+        self._build_head(adapter_dim, num_heads, ffn_dim, dropout, num_blocks, num_frames, num_classes,
+                         aggregation_mode, num_query_tokens, final_norm=True)
         print(
             f"--- ConvNeXt Self-Attention [adapter={self.adapter_name}, {self.L} features, "
             f"{self.num_blocks} block(s), aggregation={self.aggregation_mode}] weights initialized ---"
         )
+
+        if full_checkpoint_path is not None:
+            self._load_full_checkpoint(full_checkpoint_path)
+
+        if freeze_backbone:
+            freeze_module(self.backbone)
 
     # ---------------------------------------------------------
     # MODULAR EVALUATION METHODS
@@ -244,39 +174,3 @@ class ConvNextSelfAttention(nn.Module):
     def extract_features(self, x):
         # [N, 3, H, W] -> [N, L]: one vector per frame for the transformer head.
         return self.adapter(self.backbone_feature_map(x))
-
-    def forward_head(self, h):
-        # h: [num_frames, L] -> pseudo-batch [1, num_frames, L]
-        h = h.unsqueeze(0)
-        N = self.num_query_tokens
-
-        query_tokens = self.cls_token.expand(h.size(0), -1, -1)  # [1, N, L]
-        x = torch.cat((query_tokens, h), dim=1)                   # [1, N + num_frames, L]
-
-        attn_weights = None
-        for block in self.blocks:
-            x, attn_weights = block(x)
-        x = self.final_norm(x)
-
-        query_out = x[:, :N, :]
-        frame_out = x[:, N:, :]
-
-        if self.aggregation_mode == "cls_mean":
-            bag_representation = torch.cat([query_out[:, 0, :], frame_out.mean(dim=1)], dim=-1)
-        elif self.aggregation_mode == "multi_token":
-            bag_representation = query_out.reshape(query_out.size(0), -1)
-        else:  # "cls"
-            bag_representation = query_out[:, 0, :]
-
-        logits = self.classifier(bag_representation)
-
-        frame_weights = attn_weights[0, :N, N:].mean(dim=0)  # [num_frames]
-        frame_weights = frame_weights / (frame_weights.sum() + 1e-12)
-
-        return logits, frame_weights, frame_weights
-
-    def forward(self, x):
-        """x: [num_frames, 3, H, W]"""
-        h = self.extract_features(x)
-        logits, weights, _ = self.forward_head(h)
-        return logits, weights

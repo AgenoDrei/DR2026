@@ -43,7 +43,7 @@ import traceback
 
 import torch
 
-from dino.train_dino_transformer import train_self_attention
+from dino.train_dino_transformer import train_self_attention, build_parser
 
 
 SEARCH_SPACE = {
@@ -81,33 +81,21 @@ def enumerate_all_configs():
 
 
 def build_args(trial, base):
-    return argparse.Namespace(
-        classifier_checkpoint=base.classifier_checkpoint,
-        split_path=base.split_path,
-        train_json="mil_train.json",
-        val_json="mil_val.json",
-        seed=base.train_seed,
-        freeze_backbone=trial["freeze_backbone"],
-        epochs=6,
-        lr_step=3,
-        img_size=512,
-        lr=5e-5,
-        complex_augs=True,
-        use_pos_embedding=False,
-        aggregation_mode="cls",
-        num_query_tokens=1,
-        num_blocks=trial["num_blocks"],
-        num_heads=trial["num_heads"],
-        ffn_dim=2048,
-        dropout=0.1,
-        num_frames=32,
-        backbone_lr_mult=trial["backbone_lr_mult"] if trial["backbone_lr_mult"] is not None else 1.0,
-        attn_entropy_weight=trial["attn_entropy_weight"],
-        distance_scale_weight=trial["distance_scale_weight"],
-        random_segment_sample=True,
-        fused_dataset=False,
-        binary_classification=False,
-    )
+    """train_dino_transformer's own parser defaults + this sweep's fixed setup + the trial's HPs."""
+    args = build_parser().parse_args([
+        "--split_path", base.split_path,
+        "--seed", str(base.train_seed),
+        "--epochs", "6", "--lr_step", "3", "--lr", "5e-5",
+        "--complex_augs", "--random_segment_sample",
+        "--num_blocks", str(trial["num_blocks"]),
+        "--num_heads", str(trial["num_heads"]),
+        "--attn_entropy_weight", str(trial["attn_entropy_weight"]),
+        "--distance_scale_weight", str(trial["distance_scale_weight"]),
+    ])
+    args.classifier_checkpoint = base.classifier_checkpoint
+    args.freeze_backbone = trial["freeze_backbone"]
+    args.backbone_lr_mult = trial["backbone_lr_mult"] if trial["backbone_lr_mult"] is not None else 1.0
+    return args
 
 
 def main(args):

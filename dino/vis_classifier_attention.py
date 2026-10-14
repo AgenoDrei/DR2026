@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from .train_dino_classifier import DinoClassifier
-from dino.utils import make_val_transform_dino
+from dino.utils import make_val_transform_dino, clahe_rgb
 
 IMG_SIZE = 512
 TOKEN_SIZE = 16
@@ -17,39 +17,26 @@ BATCH_SIZE = 16
 
 
 # ------------------------------------------------------------
-# CLAHE (visualization only)
-# ------------------------------------------------------------
-def apply_clahe(img_rgb):
-    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-
-    lab = cv2.merge((l, a, b))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
-# ------------------------------------------------------------
 # Model
 # ------------------------------------------------------------
+class ReferableLogit(nn.Module):
+    """Wraps a 5-class classifier to output the logit of P(grade >= 2), so the
+    occlusion code below can treat binary and 5-class checkpoints alike."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        p = torch.softmax(self.model(x).float(), dim=1)[:, 2:].sum(dim=1, keepdim=True).clamp(1e-6, 1 - 1e-6)
+        return torch.log(p / (1 - p))
+
+
 def load_model(weights, device):
-    model = DinoClassifier(freeze_backbone=False, num_classes=5)
-
-    model.head = nn.Sequential(
-        nn.Linear(model.embed_dim, 512),
-        nn.ReLU(),
-        nn.Dropout(0.2),
-        nn.Linear(512, 256),
-        nn.ReLU(),
-        nn.Linear(256, 1)
-    )
-
-    state = torch.load(weights, map_location=device)
-    model.load_state_dict(state)
-
-    model.eval().to(device)
-    return model
+    model = DinoClassifier.from_checkpoint(weights)
+    if model.head[-1].out_features != 1:
+        model = ReferableLogit(model)
+    return model.eval().to(device)
 
 
 @torch.no_grad()
@@ -167,7 +154,7 @@ def process_image(model, image_path, transform, device, out_dir):
 
     heatmap, logit = compute_heatmap(model, x, device)
 
-    img_vis = apply_clahe(img)
+    img_vis = clahe_rgb(img)
 
     heatmap_up = cv2.resize(heatmap, (IMG_SIZE, IMG_SIZE), cv2.INTER_CUBIC)
 

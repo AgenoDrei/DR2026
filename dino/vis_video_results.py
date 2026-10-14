@@ -2,7 +2,6 @@ import torch
 import pandas as pd
 import os
 import json
-import re
 from PIL import Image
 from tqdm import tqdm
 import argparse
@@ -106,20 +105,16 @@ def make_result(label, grade, probs):
 # "data" says which loader the model consumes: "video" or "frame".
 # To support a new model type, write both functions and add it to MODEL_REGISTRY.
 # ----------------------------------------------------------------------------
-def infer_num_blocks(path):
-    """Reads the number of transformer blocks from a DinoSelfAttention checkpoint."""
-    state_dict = torch.load(path, map_location="cpu")
-    block_ids = {int(m.group(1)) for k in state_dict if (m := re.match(r"blocks\.(\d+)\.", k))}
-    if not block_ids:
-        raise ValueError(f"No 'blocks.N.' keys found in {path}. Is this a DinoSelfAttention checkpoint?")
-    return max(block_ids) + 1
+def _check_num_classes(model, num_classes, path):
+    model_classes = model.num_classes if hasattr(model, "num_classes") else model.head[-1].out_features
+    if model_classes != num_classes:
+        raise ValueError(f"{path} has {model_classes} output(s), expected {num_classes}.")
 
 
 def build_transformer(path, num_classes, device):
-    kwargs = {} if num_classes == 1 else {"num_classes": num_classes}
-    return DinoSelfAttention(full_checkpoint_path=path,
-                             num_blocks=infer_num_blocks(path),
-                             **kwargs).to(device)
+    model = DinoSelfAttention.from_checkpoint(path)
+    _check_num_classes(model, num_classes, path)
+    return model.to(device)
 
 
 def infer_transformer(model, loader, device, num_classes, vid_names):
@@ -142,10 +137,9 @@ def infer_transformer(model, loader, device, num_classes, vid_names):
 
 
 def build_classifier(path, num_classes, device):
-    model = DinoClassifier(freeze_backbone=True, num_classes=num_classes).to(device)
-    state_dict = torch.load(path, map_location=device)
-    model.load_state_dict(state_dict)
-    return model
+    model = DinoClassifier.from_checkpoint(path)
+    _check_num_classes(model, num_classes, path)
+    return model.to(device)
 
 
 def infer_classifier_frames(model, loader, device, num_classes, vid_names):

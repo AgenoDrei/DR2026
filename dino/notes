@@ -5,19 +5,33 @@ train_dino_classifier.py:
 trains a DINO classifier on the cropped frames, given a chosen split.
 
 train_dino_mil.py:
-trains a DINO MIL model on the cropped informative clips, given a chose split. Can also use the classifier weights
-produced in train_dino_classifier
+trains a DINO MIL model (binary) on the cropped informative clips, given a chosen split. Can also use the classifier
+weights produced in train_dino_classifier (--classifier_checkpoint).
 
 utils.py:
 some utils mostly specific to DINO
 
-vis_mil_results.py:
-runs the MIL model on all videos of a certain split and saves the confidences in mil_multi_eval/predictions_split_{split}.csv.
-Will be later used to analyse the models.
+train_dino_transformer.py:
+trains the transformer aggregator (DinoSelfAttention, head shared with convnext/ via transformer/model.py) over
+32-frame bags; --cluster_sample samples one frame per k-means cluster (clustering/, Paxos2025 only). Saves
+architecture_config.json next to the checkpoint; load runs with DinoSelfAttention.from_checkpoint(run_dir).
 
-full evaluation.py:
-(still uses the old video folder, needs to be updated before next usage)
-tries out four different ways to get the prediction for a video (e.g. take attention/logits from each frame, vs. 32 uniformly sampled frames)
+hp_sweep.py:
+grid search over transformer HPs on split_1 (results: hp_sweep_results_merged.csv). Trial args come from
+train_dino_transformer.build_parser(), so new training args are picked up automatically.
+
+vis_attention.py / vis_video_results.py / vis_classifier_attention.py:
+attention plots per video / per-video prediction CSVs for several models / occlusion heatmaps for the frame
+classifier (5-class checkpoints are scored by P(grade >= 2)).
+
+Removed experiments (see git history):
+- train_dino_transformer_rope.py (RoPE on each frame's position in the original video): 5-class, 5 splits
+  (runs/dino_sa_all_split_*_1005_1239_rope_1000.0_300): best QWK 0.843 / 0.807 / 0.839 / 0.725 / 0.775
+  (mean ~0.80); abandoned. Needed frame_maps/ JSONs that no pipeline step writes.
+- train_dino_transformer_alt_sampling.py (hierarchical: 32 anchor frames x 16-frame regions, local + global
+  attention): one run (runs/dino_hier_anchor32x16_all_split_1_0929_2004_full) never finished an epoch, no results.
+- vis_mil_results.py, full_evaluation.py: superseded by vis_video_results.py. Last 4-way eval of the MIL model
+  (max-attention frame / uniform 32 / all frames / 10x ensemble), kept for reference:
 
 Four different evals on the validation set:
 Cat: slurm-196461.out

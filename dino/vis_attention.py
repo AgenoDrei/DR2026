@@ -7,10 +7,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from data.dataset import MILVideoDataset, MILVideoDatasetRope
+from data.dataset import MILVideoDataset
 from dino.utils import make_val_transform_dino
 from dino.train_dino_transformer import DinoSelfAttention
-from dino.train_dino_transformer_rope import DinoSelfAttention as DinoSelfAttentionRope
 
 
 def unnormalize_img(tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
@@ -86,39 +85,14 @@ def analyze_attention_distribution(attention_records):
     print("--------------------------------------\n")
 
 
-def run_inference_transformer(model, loader, device, run_name, base_out_dir):
+def run_inference(model, loader, device, run_name, base_out_dir):
     model.eval()
     attention_records = []
     dataset_samples = loader.dataset.data
     attn_dir = os.path.join(base_out_dir, f"attention_vis_{run_name}")
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc="Transformer Inference (Binary)")):
-            inputs = batch[0].squeeze(0).to(device)
-            video_name = dataset_samples[i]['vid_name']
-
-            # Capture weights returned by forward()
-            _, weights = model(inputs)
-
-            # Move weights to CPU for plotting & logging
-            w_np = weights.squeeze(0).cpu().numpy()
-
-            attention_records.append({"video": video_name, "weights": w_np})
-
-            # Generate visualization
-            plot_video_attention(inputs.cpu(), w_np, video_name, attn_dir)
-
-    analyze_attention_distribution(attention_records)
-
-
-def run_inference_transformer_all(model, loader, device, run_name, base_out_dir):
-    model.eval()
-    attention_records = []
-    dataset_samples = loader.dataset.data
-    attn_dir = os.path.join(base_out_dir, f"attention_vis_{run_name}")
-
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc="Transformer Inference (Multi-class)")):
+        for i, batch in enumerate(tqdm(loader, desc="Transformer Inference")):
             inputs = batch[0].squeeze(0).to(device)
             video_name = dataset_samples[i]['vid_name']
 
@@ -126,29 +100,6 @@ def run_inference_transformer_all(model, loader, device, run_name, base_out_dir)
             w_np = weights.squeeze(0).cpu().numpy()
 
             attention_records.append({"video": video_name, "weights": w_np})
-
-            plot_video_attention(inputs.cpu(), w_np, video_name, attn_dir)
-
-    analyze_attention_distribution(attention_records)
-
-
-def run_inference_transformer_all_rope(model, loader, device, run_name, base_out_dir):
-    model.eval()
-    attention_records = []
-    dataset_samples = loader.dataset.data
-    attn_dir = os.path.join(base_out_dir, f"attention_vis_{run_name}")
-
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc="Transformer Inference (RoPE, multi-class)")):
-            inputs = batch[0].squeeze(0).to(device)
-            frame_positions = batch[3].to(device)  # keep [1, num_frames], matches cls_position's [1,1] for cat
-            video_name = dataset_samples[i]['vid_name']
-
-            _, weights = model(inputs, frame_positions)
-            w_np = weights.squeeze(0).cpu().numpy()
-
-            attention_records.append({"video": video_name, "weights": w_np})
-
             plot_video_attention(inputs.cpu(), w_np, video_name, attn_dir)
 
     analyze_attention_distribution(attention_records)
@@ -162,20 +113,12 @@ def main(args):
     for split in args.splits:
         # Load Video Split
         json_path = os.path.join(args.annotations_path, f"split_{split}", f"mil_val_{args.dataset_name}.json")
-        if args.use_rope:
-            val_ds = MILVideoDatasetRope(
-                json_path=json_path,
-                num_frames=32,
-                transform=val_trans,
-                search_dir_paths=[args.videos_path],
-            )
-        else:
-            val_ds = MILVideoDataset(
-                json_path=json_path,
-                num_frames=32,
-                transform=val_trans,
-                search_dir_paths=[args.videos_path],
-            )
+        val_ds = MILVideoDataset(
+            json_path=json_path,
+            num_frames=32,
+            transform=val_trans,
+            search_dir_paths=[args.videos_path],
+        )
         if args.limit:
             # Grab one video per grade (in dataset order) for a representative,
             # fast-to-render sample instead of the full val set.
@@ -194,41 +137,23 @@ def main(args):
         run_name = f"split_{split}"
         print(f"\n>>> Analyzing Attention for Run: {run_name}")
 
-        if args.use_rope:
-            trans_model = DinoSelfAttentionRope(
-                full_checkpoint_path=args.trans_paths[split - 1],
-                num_blocks=args.num_blocks,
-                use_rope=True,
-                rope_base=args.rope_base,
-                num_classes=1 if args.binary_classification else 5,
-            ).to(device)
-            if args.binary_classification:
-                raise NotImplementedError("RoPE attention viz currently only wired for 5-class.")
-            run_inference_transformer_all_rope(trans_model, val_loader, device, run_name, args.output_dir)
-        elif args.binary_classification:
-            trans_model = DinoSelfAttention(full_checkpoint_path=args.trans_paths[split - 1]).to(device)
-            run_inference_transformer(trans_model, val_loader, device, run_name, args.output_dir)
-        else:
-            trans_model = DinoSelfAttention(full_checkpoint_path=args.trans_paths[split - 1], num_classes=5).to(device)
-            run_inference_transformer_all(trans_model, val_loader, device, run_name, args.output_dir)
+        # Architecture (block count, classes, aggregation) comes from the run dir / checkpoint itself.
+        trans_model = DinoSelfAttention.from_checkpoint(args.trans_paths[split - 1]).to(device)
+        run_inference(trans_model, val_loader, device, run_name, args.output_dir)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--trans_paths', nargs='+', required=True, help="List of 5 Transformer checkpoint paths")
+    parser.add_argument('--trans_paths', nargs='+', required=True, help="Transformer run dirs or checkpoint paths, one per split")
     parser.add_argument('--dataset_name', type=str, default="2025")
     parser.add_argument('--annotations_path', type=str, default="data/stratified_splits")
     parser.add_argument('--videos_path', type=str, default="data/ensemble_results_paxos2025/cleaned_videos")
     parser.add_argument('--splits', type=int, nargs='+', default=[1, 2, 3, 4, 5])
     parser.add_argument('--limit', type=int, default=None, help="Only render this many videos per split (one per grade where possible).")
-    parser.add_argument('--use_rope', action='store_true')
-    parser.add_argument('--rope_base', type=float, default=1000)
-    parser.add_argument('--num_blocks', type=int, default=2)
     parser.add_argument('--output_dir', type=str, default="transformer_attention_analysis")
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--complex_augs', action='store_true')
-    parser.add_argument('--binary_classification', action='store_true')
 
     args = parser.parse_args()
     main(args)
