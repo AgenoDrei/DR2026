@@ -1,8 +1,11 @@
 import argparse
 from pathlib import Path
 
-import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
 
 parser = argparse.ArgumentParser()
 parser.add_argument("files", nargs="+", help="Input CSV files")

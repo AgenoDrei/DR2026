@@ -1,17 +1,14 @@
-"""Train the fundus-cropping segmentation model (Unet++ / EfficientNet-B4) for the
-cross-dataset experiment: one run per dataset combo (2020 / 2025 / both) and fold.
+"""Train the fundus-cropping segmentation model (Unet++ / EfficientNet-B4) for Paxos2025.
 
-Splits come from cropping/splits_<year>.json (cropping/make_splits_simple.py). For
---dataset both, fold i of 2020 and fold i of 2025 are merged (train = train_2020 +
-train_2025, val = val_2020 + val_2025). Single-dataset runs should use double the
-epochs of 'both' runs (the cohorts are about the same size) -- scripts/
-train_cropping_xdomain.sh does this automatically.
-
-Saves the best-val-IoU model to <out_dir>/seg_<dataset>_fold_<fold>.pth and a
-per-epoch log to <...>_log.json.
+One run per fold: fold i trains on the rows fold==i & split=="train" of the split CSV
+(cropping/split_cropping_5fold_paxos2025_from_q5v3.csv) and validates on fold==i &
+split=="val", so the val frames of fold i were never seen during training.
+Saves the best-val-IoU model to <out_dir>/seg_fold_<fold>.pth and a per-epoch log to
+<out_dir>/seg_fold_<fold>_log.json.
 
 Run from the repo root:
-    python -u -m cropping.train_segmentation --dataset 2025 --fold 0 --epochs 40
+    python -u -m cropping.train_segmentation --fold 0 --epochs 40
+All 5 folds: sbatch scripts/train_cropping.sh
 """
 
 import argparse
@@ -19,6 +16,10 @@ import json
 import random
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -28,6 +29,40 @@ from torch.utils.data import DataLoader
 from cropping.segmentation_pipeline import FundusDataset, get_transforms
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def save_train_batch_plots(train_loader, out_dir, n_batches=10, max_images=8):
+    """Plot the first n_batches training batches exactly as the model sees them: after
+    the augmentations and normalization (denormalized for display), with the fundus
+    mask contour overlaid. One PNG per batch: <out_dir>/batch_<nn>.png."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for b, (imgs, masks) in enumerate(train_loader):
+        if b >= n_batches:
+            break
+        imgs = imgs[:max_images]
+        masks = masks[:max_images]
+        imgs = imgs * torch.tensor(IMAGENET_STD).view(1, 3, 1, 1) + torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+        imgs = imgs.permute(0, 2, 3, 1).clamp(0, 1).numpy()
+        masks = masks[:, 0].numpy()
+        fig, axes = plt.subplots(1, len(imgs), figsize=(3 * len(imgs), 3.2))
+        if len(imgs) == 1:
+            axes = [axes]
+        for ax, img, mask in zip(axes, imgs, masks):
+            ax.imshow(img)
+            ax.contour(mask, levels=[0.5], colors="red", linewidths=1.2)
+            ax.axis("off")
+        fig.suptitle(f"Training batch {b} of fold 0 (as seen by the model, mask in red)")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"batch_{b:02d}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved += 1
+    print(f"Saved {saved} training-batch plots to {out_dir}")
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -35,33 +70,20 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_fold(ann_dir, dataset, fold):
-    """Return (train_df, val_df) for the given dataset combo and fold."""
-    ann_dir = Path(ann_dir)
-    if dataset == "both":
-        dfs, train_files, val_files = [], [], []
-        for year in ("2020", "2025"):
-            dfs.append(pd.read_csv(ann_dir / f"annotations_cropping_{year}.csv"))
-            with open(ann_dir / f"splits_{year}.json") as f:
-                s = json.load(f)[f"fold_{fold}"]
-            train_files += s["train"]
-            val_files += s["val"]
-        df = pd.concat(dfs, ignore_index=True)
-    else:
-        df = pd.read_csv(ann_dir / f"annotations_cropping_{dataset}.csv")
-        with open(ann_dir / f"splits_{dataset}.json") as f:
-            s = json.load(f)[f"fold_{fold}"]
-        train_files, val_files = s["train"], s["val"]
+def load_fold(ann_csv, splits_csv, fold):
+    """Return (train_df, val_df) for the given fold of the Paxos2025 cropping split CSV."""
+    df = pd.read_csv(ann_csv)
+    sp = pd.read_csv(splits_csv)
+    sp = sp[sp["fold"] == fold]
+    train_files = sp[sp["split"] == "train"]["filename"]
+    val_files = sp[sp["split"] == "val"]["filename"]
     return df[df["filename"].isin(train_files)], df[df["filename"].isin(val_files)]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", choices=["2020", "2025", "both"], default="both")
     parser.add_argument("--fold", type=int, default=0, help="Fold index 0..4 (its val part is held out).")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=3,
-                        help="Early stopping: stop after this many epochs without val IoU improvement.")
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--amp", action="store_true",
                         help="Mixed precision (autocast + GradScaler); big speedup on A100 tensor cores.")
@@ -70,8 +92,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--img_dir", type=str, default="cropping/frames_to_annotate_larger")
-    parser.add_argument("--ann_dir", type=str, default="cropping")
-    parser.add_argument("--out_dir", type=str, default="cropping/models_xdomain")
+    parser.add_argument("--ann_csv", type=str, default="cropping/annotations_cropping_2025.csv")
+    parser.add_argument("--splits_csv", type=str, default="cropping/split_cropping_5fold_paxos2025_from_q5v3.csv")
+    parser.add_argument("--out_dir", type=str, default="cropping/models")
     parser.add_argument("--encoder_name", type=str, default="efficientnet-b4")
     parser.add_argument("--encoder_weights", type=str, default="imagenet",
                         help="'imagenet' or 'none' for random init.")
@@ -86,8 +109,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df, val_df = load_fold(args.ann_dir, args.dataset, args.fold)
-    print(f"dataset={args.dataset} fold={args.fold}: {len(train_df)} train / {len(val_df)} val frames")
+    train_df, val_df = load_fold(args.ann_csv, args.splits_csv, args.fold)
+    print(f"fold={args.fold}: {len(train_df)} train / {len(val_df)} val frames")
 
     train_ds = FundusDataset(train_df, args.img_dir, get_transforms(train=True, img_size=args.img_size))
     val_ds = FundusDataset(val_df, args.img_dir, get_transforms(train=False, img_size=args.img_size))
@@ -96,6 +119,10 @@ def main():
                               pin_memory=pin)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
                             pin_memory=pin)
+
+    if args.fold == 0:
+        save_train_batch_plots(train_loader, Path(args.out_dir).parent / "train_vis",
+                               n_batches=10, max_images=min(args.batch_size, 8))
 
     encoder_weights = None if args.encoder_weights.lower() == "none" else args.encoder_weights
     model = smp.UnetPlusPlus(
@@ -109,12 +136,11 @@ def main():
     loss_fn = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    model_save_path = out_dir / f"seg_{args.dataset}_fold_{args.fold}.pth"
-    log_path = out_dir / f"seg_{args.dataset}_fold_{args.fold}_log.json"
+    model_save_path = out_dir / f"seg_fold_{args.fold}.pth"
+    log_path = out_dir / f"seg_fold_{args.fold}_log.json"
 
     best_iou = -1.0  # guarantees a checkpoint is saved even if val IoU stays 0
     best_epoch = -1
-    stopped_early = False
     log = []
     for epoch in range(args.epochs):
         model.train()
@@ -147,7 +173,7 @@ def main():
         iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro").item()
         epoch_log = {"epoch": epoch, "train_loss": float(np.mean(train_loss)), "val_iou": iou}
         log.append(epoch_log)
-        print(f"dataset={args.dataset} Fold {args.fold} | Epoch {epoch + 1}/{args.epochs} | "
+        print(f"Fold {args.fold} | Epoch {epoch + 1}/{args.epochs} | "
               f"Train Loss: {epoch_log['train_loss']:.4f} | Val IoU: {iou:.4f}")
 
         if iou > best_iou:
@@ -156,17 +182,11 @@ def main():
             torch.save(model.state_dict(), model_save_path)
             print(f"   -> New Best IoU! Saved {model_save_path}")
 
-        if epoch - best_epoch >= args.patience:
-            stopped_early = True
-            print(f"   -> Early stopping: no val IoU improvement for {args.patience} epochs "
-                  f"(best {best_iou:.4f} at epoch {best_epoch + 1})")
-            break
-
     with open(log_path, "w") as f:
-        json.dump({"dataset": args.dataset, "fold": args.fold, "epochs": args.epochs,
-                   "epochs_run": len(log), "stopped_early": stopped_early,
+        json.dump({"fold": args.fold, "epochs": args.epochs,
+                   "epochs_run": len(log),
                    "best_epoch": best_epoch, "best_val_iou": best_iou, "history": log}, f, indent=2)
-    print(f"Finished dataset={args.dataset} fold={args.fold} after {len(log)}/{args.epochs} epochs. "
+    print(f"Finished fold={args.fold} after {len(log)}/{args.epochs} epochs. "
           f"Best Val IoU: {best_iou:.4f} (epoch {best_epoch + 1})")
 
 

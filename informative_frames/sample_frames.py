@@ -28,8 +28,6 @@ def extract_fast_lossless():
 
         # 7-frame scheme matches informative_frames/split_info_full.csv (Paxos2025 labels)
         targets = [int(total_frames * k / 8) for k in range(1, 8)]
-        # 4-frame scheme matches informative_frames/manual_labels_binary_paxos2020.csv (Paxos2020 labels)
-        # targets = [int(total_frames * f) for f in [0.2, 0.4, 0.6, 0.8]]
 
         print(f"Processing: {video_path.name}")
 

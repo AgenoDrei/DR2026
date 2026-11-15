@@ -10,7 +10,7 @@ from informative_frames.crop_frames import get_largest_component_mask, pad_to_sq
 
 IMG_DIR = Path('data/2024_Paxos_Frames/matched_frames')
 CROPPED_DIR = Path('data/2024_Paxos_Frames/cropped_matched_frames')
-SEG_MODEL_DIR = Path('cropping/models/2025')
+SEG_MODEL_DIR = Path('cropping/models')
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 IMG_SIZE = 768

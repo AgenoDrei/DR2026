@@ -1,23 +1,24 @@
-"""Full ensemble production pipeline: videos -> cleaned clips + per-frame prob txt + plot.
+"""Paxos2025 production pipeline: videos -> cleaned clips + per-frame prob txt + plot.
 
-Model choice per video follows the same rule as cropping/evaluate_segmentation.py:
-with --dataset given, a video is scored by the fold-i model of its val fold (from
-<splits_dir>/splits_<dataset>.json, the cropping splits) when the model config matches
-the dataset (--seg_config/--cls_config == --dataset) -- i.e. ONLY the model that was
-NOT trained on that video; otherwise (config is the other dataset, or the video is
-unknown to the splits) the full n-fold ensemble is used, averaging sigmoid PROBABILITIES
-(not logits). Without --dataset the full ensemble is used for every video (old behaviour).
+Only the videos of the q5_v3 split lists (data/stratified_splits_paxos2025_patient_q5_v3,
+280 videos) are processed; all other videos in --video_dir are skipped. A video in the
+val part of q5_v3 fold i is scored by the fold-i seg and cls models -- i.e. ONLY the
+models that were NOT trained on that video.
 
-Run from the repo root, e.g. Paxos2025 videos with the Paxos2025 models:
+Pre-processing (same as cropping/segment_frames.py and informative_frames/crop_frames.py):
+each 1080x1920 frame is padded to a square (pad_to_square_info), the segmentation model
+predicts at 768x768, the probability mask is mapped back through the padding offsets,
+the largest connected component is kept, and a square crop is taken around its bounding
+box (crop_and_pad); the classifier runs on the crop at 512x512.
+
+Run from the repo root:
     python -u -m informative_frames.extract_inf_frames \
-      --dataset 2025 --video_dir data/dr_videos \
-      --seg_model_dir cropping/models_xdomain --cls_model_dir informative_frames/models_xdomain \
-      --seg_config 2025 --cls_config 2025 --out_base data/ensemble_results_paxos2025_by_2025
-See scripts/extract_inf_frames_xdomain.sh for all three x-domain runs.
+      --video_dir data/dr_videos \
+      --seg_model_dir cropping/models --cls_model_dir informative_frames/models \
+      --out_base data/ensemble_results_paxos2025
 """
 
 import cv2
-import re
 import torch
 import numpy as np
 import argparse
@@ -31,35 +32,28 @@ import albumentations as albu
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 
+from cropping.make_splits_from_q5v3 import load_q5_video_folds
 from misc.utils import apply_clahe_cv2
 from .crop_frames import crop_and_pad, get_largest_component_mask, pad_to_square_info
-from .make_splits_from_cropping import load_stem_folds
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Full Ensemble Production Pipeline")
+    parser = argparse.ArgumentParser(description="Paxos2025 Informative-Frame Production Pipeline")
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--total_gpus', type=int, default=1)
     parser.add_argument('--limit', type=int, default=None, help="Max videos per worker.")
 
-    parser.add_argument('--video_dir', type=str, default='data/dr_videos')
+    parser.add_argument('--video_dir', type=str, default='data/dr_videos',
+                        help="Paxos2025 videos; only those in the q5_v3 split lists are processed.")
     parser.add_argument('--seg_model_dir', type=str, default='cropping/models')
     parser.add_argument('--cls_model_dir', type=str, default='informative_frames/models')
-    parser.add_argument('--out_base', type=str, default='data/ensemble_results')
+    parser.add_argument('--q5_dir', type=str, default='data/stratified_splits_paxos2025_patient_q5_v3',
+                        help="q5_v3 split lists; their videos define which videos are processed and with which fold model.")
+    parser.add_argument('--out_base', type=str, default='data/ensemble_results_paxos2025')
     parser.add_argument('--min_informative_frames', type=int, default=32,
                         help="Guaranteed minimum length of the cleaned clip.")
     parser.add_argument('--infer_batch_size', type=int, default=16,
-                        help="Frames batched per ensemble forward pass in PASS 1.")
-    parser.add_argument('--dataset', type=str, default=None, choices=["2020", "2025"],
-                        help="Cohort of the videos in --video_dir. If given, each video is scored by the "
-                             "fold model of its val fold when the model config matches the dataset, else by "
-                             "the full ensemble. Default None: always full ensemble (old behaviour).")
-    parser.add_argument('--seg_config', type=str, default=None, choices=["2020", "2025", "both"],
-                        help="Config of the seg models in --seg_model_dir; default: derived from the dir name.")
-    parser.add_argument('--cls_config', type=str, default=None, choices=["2020", "2025", "both"],
-                        help="Config of the cls models in --cls_model_dir; default: derived from cls_<config>_fold_<i>.pth names.")
-    parser.add_argument('--splits_dir', type=str, default='cropping',
-                        help="Dir with splits_<dataset>.json (cropping splits) used for the per-video val fold.")
+                        help="Frames batched per forward pass in PASS 1.")
     parser.add_argument('--n_splits', type=int, default=5)
     return parser.parse_args()
 
@@ -101,22 +95,8 @@ def main():
     SEG_MODEL_DIR = Path(args.seg_model_dir)
     CLS_MODEL_DIR = Path(args.cls_model_dir)
 
-    if args.seg_config is None:
-        name = SEG_MODEL_DIR.name
-        args.seg_config = name if name in ("2020", "2025", "both") else None
-    if args.cls_config is None:
-        for p in sorted(CLS_MODEL_DIR.glob("cls_*_fold_*.pth")):
-            m = re.fullmatch(r"cls_(.+)_fold_\d+\.pth", p.name)
-            if m:
-                args.cls_config = m.group(1)
-                break
-
-    stem_fold = {}
-    if args.dataset:
-        stem_fold = load_stem_folds(Path(args.splits_dir) / f"splits_{args.dataset}.json", args.n_splits)
-        print(f"dataset={args.dataset}: mapped {len(stem_fold)} videos to their val fold "
-              f"from {args.splits_dir}/splits_{args.dataset}.json "
-              f"(seg_config={args.seg_config}, cls_config={args.cls_config})")
+    stem_fold = load_q5_video_folds(args.q5_dir, args.n_splits)
+    print(f"q5_v3: {len(stem_fold)} videos mapped to their val fold from {args.q5_dir}")
 
     OUT_BASE = Path(args.out_base)
     TXT_DIR = OUT_BASE / 'txt_files'
@@ -137,17 +117,17 @@ def main():
     seg_ensemble = []
     cls_ensemble = []
     for fold in range(args.n_splits):
-        seg_paths = sorted(SEG_MODEL_DIR.glob(f"seg_{args.seg_config}_fold_{fold}*.pth")) if args.seg_config else []
+        seg_paths = sorted(SEG_MODEL_DIR.glob(f"seg_fold_{fold}*.pth"))
         if not seg_paths:
             seg_paths = sorted(SEG_MODEL_DIR.glob(f"*fold_{fold}*.pth"))
         if not seg_paths:
             raise FileNotFoundError(f"Could not find seg model for fold {fold} in {SEG_MODEL_DIR} "
-                                    f"(tried seg_{args.seg_config}_fold_{fold}*.pth and *fold_{fold}*)")
+                                    f"(tried seg_fold_{fold}*.pth and *fold_{fold}*)")
         sm = smp.UnetPlusPlus(encoder_name="efficientnet-b4", in_channels=3, classes=1).to(DEVICE).eval()
         sm.load_state_dict(torch.load(seg_paths[0], map_location=DEVICE))
         seg_ensemble.append(sm)
 
-        cls_paths = sorted(CLS_MODEL_DIR.glob(f"cls_{args.cls_config}_fold_{fold}*.pth")) if args.cls_config else []
+        cls_paths = sorted(CLS_MODEL_DIR.glob(f"cls_fold_{fold}*.pth"))
         if not cls_paths:
             cls_paths = sorted(CLS_MODEL_DIR.glob(f"*Fold{fold}*.pth"))
         if not cls_paths:
@@ -167,23 +147,23 @@ def main():
     ])
 
     all_vids = sorted([p for p in VIDEO_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".mp4", ".avi", ".mov"}])
+    all_vids = [v for v in all_vids if v.stem in stem_fold]
     my_vids = [v for i, v in enumerate(all_vids) if i % args.total_gpus == args.gpu_id]
     if args.limit: my_vids = my_vids[:args.limit]
-    print(f"Worker {args.gpu_id}: Processing {len(my_vids)} videos.")
+    print(f"Worker {args.gpu_id}: Processing {len(my_vids)} of {len(all_vids)} q5_v3 videos "
+          f"(skipped {len(all_vids) - len(my_vids)} for this worker).")
 
     for v_path in tqdm(my_vids, desc=f"Overall GPU {args.gpu_id}"):
         vid_id = v_path.stem
 
-        fold = stem_fold.get(vid_id) if stem_fold else None
-        seg_single = args.dataset is not None and args.seg_config == args.dataset and fold is not None
-        cls_single = args.dataset is not None and args.cls_config == args.dataset and fold is not None
-        seg_models = [seg_ensemble[fold]] if seg_single else seg_ensemble
-        cls_models = [cls_ensemble[fold]] if cls_single else cls_ensemble
-        seg_mode = f"fold {fold} (val fold, not in its training)" if seg_single else f"{len(seg_ensemble)}-fold prob ensemble"
-        cls_mode = f"fold {fold} (val fold, not in its training)" if cls_single else f"{len(cls_ensemble)}-fold prob ensemble"
+        fold = stem_fold.get(vid_id)
+        seg_models = [seg_ensemble[fold]] if fold is not None else seg_ensemble
+        cls_models = [cls_ensemble[fold]] if fold is not None else cls_ensemble
+        seg_mode = f"fold {fold} (val fold, not in its training)" if fold is not None else f"{len(seg_ensemble)}-fold prob ensemble"
+        cls_mode = f"fold {fold} (val fold, not in its training)" if fold is not None else f"{len(cls_ensemble)}-fold prob ensemble"
         print(f"{vid_id}: seg={seg_mode} | cls={cls_mode}")
 
-        out_vid_path = VID_DIR / f"CLEAN_{vid_id}.mp4"
+        out_vid_path = VID_DIR / f"{vid_id}.mp4"
         txt_path = TXT_DIR / f"{vid_id}.txt"
         plot_path = PLOT_DIR / f"{vid_id}.png"
 
@@ -194,7 +174,7 @@ def main():
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # PASS 1: Ensemble Analysis (batched)
+        # PASS 1: Analysis (batched)
         frame_results = []
         global_max_dim = 0
         amp_ctx = lambda: torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda'))
@@ -288,7 +268,7 @@ def main():
         df_res.to_csv(TXT_DIR / f"{vid_id}.txt", sep='\t', index=False)
 
         plt.figure(figsize=(10, 4))
-        plt.plot(df_res['frame'], df_res['prob'], label='Ensemble Prob')
+        plt.plot(df_res['frame'], df_res['prob'], label='Mean Prob')
         plt.axhline(y=CONF_THRESHOLD, color='r', linestyle='--', alpha=0.5, label=f'Preferred ({CONF_THRESHOLD})')
         if threshold_used != CONF_THRESHOLD and not used_fallback:
             plt.axhline(y=threshold_used, color='orange', linestyle='--', label=f'Used ({threshold_used})')

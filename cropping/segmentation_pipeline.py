@@ -1,30 +1,17 @@
-import json
-import torch
+"""Dataset and transforms shared by the Paxos2025 cropping stage.
+
+FundusDataset builds the fundus mask from the ellipse annotation columns
+(center_x, center_y, radius_x, radius_y) of cropping/annotations_cropping_2025.csv.
+"""
+
 import cv2
 import numpy as np
-import pandas as pd
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
-import segmentation_models_pytorch as smp
+from torch.utils.data import Dataset
 import albumentations as albu
 from albumentations.pytorch import ToTensorV2
-from sklearn.model_selection import KFold
-import matplotlib
 
-matplotlib.use('Agg')
-
-IMG_DIR = Path('cropping/frames_to_annotate_larger')
-CSV_PATH = Path('cropping/annotations_video_frames_larger.csv')
-OUTPUT_DIR = Path('cropping/models')
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-EPOCHS = 20
-BATCH_SIZE = 4
-LR = 1e-4
 IMG_SIZE = 768
-N_SPLITS = 5
-SPLITS_JSON_PATH = 'cropping/splits.json'
 
 
 class FundusDataset(Dataset):
@@ -98,104 +85,3 @@ def get_transforms(train=True, img_size=IMG_SIZE):
             albu.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
         ])
-
-
-def run_training():
-    if not CSV_PATH.exists():
-        print(f"Error: {CSV_PATH} not found.")
-        return
-
-    df = pd.read_csv(CSV_PATH)
-    print(f"Total images found in CSV: {len(df)}")
-
-    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    splits_dict = {}
-
-    for fold, (train_idx, val_idx) in enumerate(kf.split(df)):
-        splits_dict[f"fold_{fold}"] = {
-            "train": df.iloc[train_idx]['filename'].tolist(),
-            "val": df.iloc[val_idx]['filename'].tolist()
-        }
-
-    with open(SPLITS_JSON_PATH, 'w') as f:
-        json.dump(splits_dict, f, indent=4)
-    print(f"Saved cross-validation splits to {SPLITS_JSON_PATH}")
-
-    for fold in range(N_SPLITS):
-        print(f"\n{'=' * 30}")
-        print(f"Starting Training for FOLD {fold + 1}/{N_SPLITS}")
-        print(f"{'=' * 30}")
-
-        # Extract data for current fold
-        train_filenames = splits_dict[f"fold_{fold}"]["train"]
-        val_filenames = splits_dict[f"fold_{fold}"]["val"]
-
-        train_df = df[df['filename'].isin(train_filenames)]
-        valid_df = df[df['filename'].isin(val_filenames)]
-
-        train_ds = FundusDataset(train_df, IMG_DIR, get_transforms(train=True))
-        valid_ds = FundusDataset(valid_df, IMG_DIR, get_transforms(train=False))
-
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-        valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-
-        # Initialize Modernized Model (U-Net++ with EfficientNet-b4 encoder)
-        model = smp.UnetPlusPlus(
-            encoder_name="efficientnet-b4",
-            encoder_weights="imagenet",
-            in_channels=3,
-            classes=1
-        ).to(DEVICE)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-        loss_fn = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
-
-        best_iou = 0.0
-        model_save_path = f'cropping/models/best_model_fold_{fold}.pth'
-
-        for epoch in range(EPOCHS):
-            model.train()
-            train_loss = []
-
-            for imgs, masks in train_loader:
-                imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
-
-                optimizer.zero_grad()
-                output = model(imgs)
-                loss = loss_fn(output, masks)
-                loss.backward()
-                optimizer.step()
-
-                train_loss.append(loss.item())
-
-            # Validation
-            model.eval()
-            tp, fp, fn, tn = 0, 0, 0, 0
-
-            with torch.no_grad():
-                for imgs, masks in valid_loader:
-                    imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
-                    output = model(imgs)
-                    pred = (torch.sigmoid(output) > 0.5).long()
-
-                    s = smp.metrics.get_stats(pred, masks.long(), mode='binary')
-                    tp += s[0].sum()
-                    fp += s[1].sum()
-                    fn += s[2].sum()
-                    tn += s[3].sum()
-
-            iou = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro").item()
-
-            print(
-                f"Fold {fold} | Epoch {epoch + 1}/{EPOCHS} | Train Loss: {np.mean(train_loss):.4f} | Val IoU: {iou:.4f}")
-
-            if iou > best_iou:
-                best_iou = iou
-                torch.save(model.state_dict(), model_save_path)
-                print(f"   -> New Best IoU! Saved {model_save_path}")
-
-        print(f"Finished Fold {fold}. Best Val IoU: {best_iou:.4f}")
-
-
-if __name__ == "__main__":
-    run_training()

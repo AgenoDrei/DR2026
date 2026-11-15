@@ -1,0 +1,11 @@
+fold,set,total,n_videos,n_patients
+1,train,333,333,283
+1,val,84,84,72
+2,train,332,332,284
+2,val,85,85,71
+3,train,332,332,283
+3,val,85,85,72
+4,train,339,339,287
+4,val,78,78,68
+5,train,332,332,283
+5,val,85,85,72

@@ -1,36 +1,24 @@
-"""Crop the raw informative frames with the x-domain cropping models -> 6 folders.
+"""Crop the raw Paxos2025 informative frames with the 5-fold cropping models.
 
-For each (dataset, config) pair -- dataset 2025 = data/informative_frames/frames_raw_extract,
-dataset 2020 = data/informative_frames/frames_raw_extract_paxos2020, config in {2020, 2025, both}
-with the checkpoints in cropping/models_xdomain (seg_<config>_fold_<i>.pth; a per-config
-folder like cropping/models/<config> also works via the *fold_<i>* fallback glob) -- every
-labeled frame of the dataset is cropped and written to
-<output_dir>/<label>/<filename> (ImageFolder layout with classes 0/1, so classify_frames.py-style
-training can consume each folder directly). Labels and per-frame folds come from the split CSV
-built by informative_frames/make_splits_from_cropping.py (split_info_5fold_paxos<dataset>_from_cropping.csv,
-row with split == "val").
+Every labeled frame (from the split CSV built by cropping/make_splits_from_q5v3.py,
+rows with split == "val") is cropped and written to <output_dir>/<label>/<filename>
+(ImageFolder layout with classes 0/1, so classify_frames.py can consume the folder directly).
 
-Which model crops a frame follows the same rule as cropping/evaluate_segmentation.py and
-cropping/vis_compare_models.py:
+Each frame is cropped by the fold-i segmentation model of its own val fold
+(cropping/models/seg_fold_<i>.pth) -- the model that never saw the frame during training,
+exactly the anti-leakage rule of cropping/evaluate_segmentation.py.
 
-- in-dataset (config == dataset or config == "both"): the fold-i model of the config whose val
-  split contains the frame's video -- the model that never saw the frame during training.
-  ("both" is trained on fold-i val of 2020 + fold-i val of 2025, so the frame's own val fold
-  from its dataset's split CSV is the right fold here too.)
-- cross-dataset (config != dataset and config != "both"): that config never saw this dataset,
-  so ALL 5 fold models are ensembled by mean sigmoid PROBABILITY (threshold 0.5) -- the same
-  ensembling as extract_inf_frames.py (probabilities, not logits).
+Pre-processing (same as cropping/segment_frames.py and informative_frames/extract_inf_frames.py):
+the raw 1080x1920 frame is padded to a square (pad_to_square_info), the model predicts at
+768x768, the probability mask is mapped back through the padding offsets, the largest
+connected component is kept, and a square crop is taken around its bounding box (crop_and_pad).
 
-That yields 6 output folders, e.g. data/informative_frames/frames_cropped_paxos2025_by_{2020,2025,both}
-and frames_cropped_paxos2020_by_{2020,2025,both}; scripts/crop_frames_xdomain.sh runs all 6.
-
-Run a single folder from the repo root:
+Run from the repo root:
     python -u -m informative_frames.crop_frames \
-      --dataset 2025 --config 2025 \
       --input_dir data/informative_frames/frames_raw_extract \
-      --split_csv informative_frames/split_info_5fold_paxos2025_from_cropping.csv \
-      --model_dir cropping/models_xdomain \
-      --output_dir data/informative_frames/frames_cropped_paxos2025_by_2025
+      --split_csv informative_frames/split_info_5fold_paxos2025_from_q5v3.csv \
+      --model_dir cropping/models \
+      --output_dir data/informative_frames/frames_cropped
 """
 
 import argparse
@@ -48,17 +36,13 @@ from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", choices=["2020", "2025"], required=True,
-                        help="Which dataset's frames are cropped (2025=frames_raw_extract, 2020=frames_raw_extract_paxos2020).")
-    parser.add_argument("--config", choices=["2020", "2025", "both"], required=True,
-                        help="Which cropping model config crops the frames; --model_dir points at its checkpoint folder.")
-    parser.add_argument("--input_dir", type=str, required=True, help="Raw frame folder of the dataset.")
-    parser.add_argument("--split_csv", type=str, required=True,
-                        help="split_info_5fold_paxos<dataset>_from_cropping.csv (label + val fold per frame).")
-    parser.add_argument("--model_dir", type=str, required=True,
-                        help="Checkpoint dir, e.g. cropping/models_xdomain; prefers seg_<config>_fold_<i>*.pth, "
-                             "falls back to *fold_<i>* (per-config folder).")
-    parser.add_argument("--output_dir", type=str, required=True,
+    parser.add_argument("--input_dir", type=str, default="data/informative_frames/frames_raw_extract",
+                        help="Raw Paxos2025 frame folder.")
+    parser.add_argument("--split_csv", type=str, default="informative_frames/split_info_5fold_paxos2025_from_q5v3.csv",
+                        help="Split CSV (filename,video_id,label,fold,split) with label + val fold per frame.")
+    parser.add_argument("--model_dir", type=str, default="cropping/models",
+                        help="Checkpoint dir with seg_fold_<i>.pth.")
+    parser.add_argument("--output_dir", type=str, default="data/informative_frames/frames_cropped",
                         help="Output folder; cropped frames land in <output_dir>/<label>/<filename>.")
     parser.add_argument("--img_size", type=int, default=768, help="Model input size (as trained).")
     parser.add_argument("--batch_size", type=int, default=16)
@@ -75,16 +59,16 @@ def get_inference_transforms(img_size=768):
     ])
 
 
-def load_ensemble(model_dir, config, n_splits, encoder_name, device):
+def load_fold_models(model_dir, n_splits, encoder_name, device):
     model_dir = Path(model_dir)
     models = []
     for fold in range(n_splits):
-        model_paths = sorted(model_dir.glob(f"seg_{config}_fold_{fold}*.pth"))
+        model_paths = sorted(model_dir.glob(f"seg_fold_{fold}*.pth"))
         if not model_paths:
             model_paths = sorted(model_dir.glob(f"*fold_{fold}*"))
         if not model_paths:
             raise FileNotFoundError(f"Could not find model for fold {fold} in {model_dir} "
-                                    f"(tried seg_{config}_fold_{fold}*.pth and *fold_{fold}*)")
+                                    f"(tried seg_fold_{fold}*.pth and *fold_{fold}*)")
         model = smp.UnetPlusPlus(encoder_name=encoder_name, encoder_weights=None, in_channels=3, classes=1)
         model.load_state_dict(torch.load(model_paths[0], map_location=device))
         model.to(device).eval()
@@ -153,33 +137,24 @@ def main():
         print(f"WARNING: {len(missing)} labeled frames not found in {input_dir} -- skipped, "
               f"e.g. {missing[:3]}")
     files = [p for p in on_disk if p.name in frame_label]
-    print(f"dataset={args.dataset} config={args.config}: cropping {len(files)} frames from {input_dir} "
-          f"into {output_dir}")
+    print(f"cropping {len(files)} frames from {input_dir} into {output_dir}")
 
-    models = load_ensemble(args.model_dir, args.config, args.n_splits, args.encoder_name, device)
+    models = load_fold_models(args.model_dir, args.n_splits, args.encoder_name, device)
     print(f"Loaded {len(models)} fold models from {args.model_dir} on {device}")
-
-    in_dataset = (args.config == args.dataset) or (args.config == "both")
-    if in_dataset:
-        groups = [(f"fold_{fold}", [p for p in files if frame_fold[p.name] == fold], [models[fold]])
-                  for fold in range(args.n_splits)]
-        mode = "in-dataset: each frame cropped by the fold model of its val fold (never trained on it)"
-    else:
-        groups = [("ensemble", files, models)]
-        mode = (f"cross-dataset: all frames cropped by the {args.n_splits}-fold probability ensemble "
-                f"(mean sigmoid prob, config {args.config} never saw dataset {args.dataset})")
-    print(mode)
+    print("each frame is cropped by the fold model of its val fold (never trained on it)")
 
     transforms = get_inference_transforms(args.img_size)
     for label in sorted({frame_label[p.name] for p in files}):
         (output_dir / str(label)).mkdir(parents=True, exist_ok=True)
 
     total_written = total_skipped = 0
-    for group_name, group_files, group_models in groups:
+    for fold in range(args.n_splits):
+        group_files = [p for p in files if frame_fold[p.name] == fold]
         if not group_files:
             continue
+        model = models[fold]
         written = skipped = 0
-        for start in tqdm(range(0, len(group_files), args.batch_size), desc=group_name, leave=False):
+        for start in tqdm(range(0, len(group_files), args.batch_size), desc=f"fold_{fold}", leave=False):
             batch_paths = group_files[start:start + args.batch_size]
             batch = []
             for p in batch_paths:
@@ -199,7 +174,7 @@ def main():
                 continue
             x = torch.stack([b[5] for b in batch]).to(device)
             with torch.no_grad():
-                probs = torch.stack([torch.sigmoid(m(x)) for m in group_models]).mean(dim=0)[:, 0]
+                probs = torch.sigmoid(model(x))[:, 0]
             probs = probs.float().cpu().numpy()
             for (p, frame, y_off, x_off, side, _, out_path), prob in zip(batch, probs):
                 h, w = frame.shape[:2]
@@ -214,7 +189,7 @@ def main():
                 cropped = crop_and_pad(masked, (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1))
                 cv2.imwrite(str(out_path), cropped)
                 written += 1
-        print(f"  {group_name}: wrote {written}, skipped {skipped} (existing/unreadable/no-retina)")
+        print(f"  fold_{fold}: wrote {written}, skipped {skipped} (existing/unreadable/no-retina)")
         total_written += written
         total_skipped += skipped
 
