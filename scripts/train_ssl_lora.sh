@@ -20,5 +20,5 @@ mkdir -p dino/logs
 tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
 tmux new-window -d -t "$SESSION" -n "$win" -c "$PWD" \
   "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu -n $NGPU run env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --standalone --nproc_per_node $NGPU \
- -m dino.ssl_lora --run_tag $TAG $EXTRA 2>&1 | tee $log; exec bash"
+ -m dino.ssl_lora --run_tag $TAG $EXTRA 2>&1 | tee $log; exec env TMOUT=3600 bash"
 echo "launched $win ($NGPU GPUs) -> $log"

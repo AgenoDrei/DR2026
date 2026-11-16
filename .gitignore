@@ -26,6 +26,7 @@ CLAUDE.md
 __pycache__/
 *.log
 dino/logs/
+adafocus/logs/
 results/*.lock
 results/*.tmp
 **/notes

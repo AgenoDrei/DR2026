@@ -59,7 +59,7 @@ for job in "${JOBS[@]}"; do
   win=${name}_${XTAG}_s$seed
   log=$pkg/logs/${win}_$(date +%Y-%m-%d_%H-%M).log
   tmux new-window -d -t "$SESSION" -n "$win" -c "$PWD" \
-    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd 2>&1 | tee $log; exec bash"
+    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd 2>&1 | tee $log; exec env TMOUT=3600 bash"
   echo "$(date '+%m-%d %H:%M') launched $win -> $log"
   sleep 90  # let the run claim its card before the next check
 done

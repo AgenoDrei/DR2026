@@ -69,13 +69,25 @@ class BagTransformer(nn.Module):
       token still takes part in the blocks but isn't read.
     frame_weights (used for attention viz and the entropy/distance-scale
     loss terms) is the query token(s)' attention to the frames, averaged
-    over query tokens and summed over each frame's region tokens."""
+    over query tokens and summed over each frame's region tokens.
+
+    head_dim: LayerNorm + Linear(dim -> head_dim) + dropout on the frame tokens first; blocks, embeddings
+    and MLP head then run at head_dim (narrow head, fewer params). pool_temp: sparse_pool scores are
+    multiplied by a learnable temperature (initialized at pool_temp) so the zero-init scores can leave
+    near-uniform pooling (without it the trained pooling stays ~mean pooling)."""
 
     def _build_head(self, dim, num_heads, ffn_dim, dropout, num_blocks, num_frames, num_classes,
                     aggregation_mode, num_query_tokens, use_pos_embedding=False, final_norm=False,
-                    tokens_per_frame=1):
+                    tokens_per_frame=1, head_dim=None, pool_temp=None):
         if aggregation_mode not in AGGREGATION_MODES:
             raise ValueError(f"Unknown aggregation_mode: {aggregation_mode}")
+        if pool_temp and aggregation_mode != "sparse_pool":
+            raise ValueError("pool_temp only applies to aggregation_mode='sparse_pool'")
+
+        self.in_proj = None
+        if head_dim:
+            self.in_proj = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, head_dim), nn.Dropout(dropout))
+            dim = head_dim
 
         self.L = dim
         self.num_blocks = num_blocks
@@ -104,6 +116,8 @@ class BagTransformer(nn.Module):
         if self.pool_score is not None:
             nn.init.zeros_(self.pool_score.weight)
             nn.init.zeros_(self.pool_score.bias)
+        # log temperature, learnable; None = plain scores (older runs)
+        self.pool_log_temp = nn.Parameter(torch.tensor(float(pool_temp)).log()) if pool_temp else None
 
         classifier_in_dim = {"cls": dim, "cls_mean": 2 * dim, "multi_token": self.num_query_tokens * dim,
                              "sparse_pool": dim}
@@ -180,12 +194,18 @@ class BagTransformer(nn.Module):
             config.pop("grid_pool", None)
             if "grid" in (config.get("adapter"), config.get("dense_adapter")):
                 raise ValueError(f"{run_dir} was trained with the removed grid adapter.")
+            # cls_residual adapter (+ its adapter_attn_temp) removed 2026-11-16.
+            config.pop("adapter_attn_temp", None)
+            if config.get("dense_adapter") == "cls_residual":
+                raise ValueError(f"{run_dir} was trained with the removed cls_residual adapter.")
         else:
             config = cls.config_from_state_dict(torch.load(ckpt, map_location="cpu"))
         return cls(full_checkpoint_path=ckpt, **config)
 
     def forward_head(self, h):
         # h: [num_frames, L] or [num_frames, K, L] -> pseudo-batch [1, num_frames(*K), L]
+        if self.in_proj is not None:
+            h = self.in_proj(h)
         h = h.unsqueeze(0)
         T = h.size(1)
 
@@ -219,6 +239,8 @@ class BagTransformer(nn.Module):
         pool_weights = None
         if self.aggregation_mode == "sparse_pool":
             scores = self.pool_score(frame_out).squeeze(-1).float()  # [1, num_frames*K]
+            if self.pool_log_temp is not None:
+                scores = scores * self.pool_log_temp.float().exp()
             pool_weights = sparsemax(scores, dim=-1)  # [1, num_frames*K], sums to 1
             bag_representation = (pool_weights.unsqueeze(-1).to(frame_out.dtype) * frame_out).sum(dim=1)  # [1, L]
         elif self.aggregation_mode == "cls_mean":

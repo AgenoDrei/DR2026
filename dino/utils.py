@@ -200,13 +200,31 @@ def _p20_augs(extra_augs):
     return [Paxos2020Aug(groups)] if groups else []
 
 
-def make_train_transform_dino(img_size, complex_augs, extra_augs=(), clahe=True):
-    """extra_augs (subset of EXTRA_AUGS) only applies with complex_augs; clahe=False drops CLAHE from complex_augs."""
+def _train_resize(img_size, train_zoom):
+    """Resize to img_size, or with train_zoom (lo, hi) a random square crop of 1/hi..1/lo of the side (area scale uniform in
+    [1/hi^2, 1/lo^2]) at a random position, resized to img_size: zoom-in plus spatial shift."""
+    if not train_zoom:
+        return v2.Resize((img_size, img_size), antialias=True)
+    lo, hi = train_zoom
+    return v2.RandomResizedCrop(img_size, scale=(1 / hi ** 2, 1 / lo ** 2), ratio=(1.0, 1.0), antialias=True)
+
+
+def _val_resize(img_size, zoom):
+    """Resize to img_size, center-zoomed by `zoom` (> 1: resize to img_size * zoom, then center crop img_size)."""
+    if zoom <= 1:
+        return [v2.Resize((img_size, img_size), antialias=True)]
+    side = round(img_size * zoom)
+    return [v2.Resize((side, side), antialias=True), v2.CenterCrop(img_size)]
+
+
+def make_train_transform_dino(img_size, complex_augs, extra_augs=(), clahe=True, train_zoom=None):
+    """extra_augs (subset of EXTRA_AUGS) only applies with complex_augs; clahe=False drops CLAHE from complex_augs.
+    train_zoom (lo, hi): random zoom-in + shift instead of the plain resize (_train_resize)."""
     if complex_augs:
         jpeg, blur, noise = _degrade_augs(extra_augs)
         return v2.Compose([
             v2.ToImage(),
-            v2.Resize((img_size, img_size), antialias=True),
+            _train_resize(img_size, train_zoom),
             *jpeg,
 
             *([v2.Lambda(apply_clahe_cv2_dino)] if clahe else []),
@@ -224,17 +242,17 @@ def make_train_transform_dino(img_size, complex_augs, extra_augs=(), clahe=True)
             )
         ])
     else:
-        return v2.Compose([v2.ToImage(), v2.Resize((img_size, img_size), antialias=True),
+        return v2.Compose([v2.ToImage(), _train_resize(img_size, train_zoom),
                            v2.ToDtype(torch.float32, scale=True),
                            v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),)
                            ])
 
 
-def make_bag_train_transforms_dino(img_size, complex_augs, extra_augs=(), clahe=True):
+def make_bag_train_transforms_dino(img_size, complex_augs, extra_augs=(), clahe=True, train_zoom=None):
     """Train augs split for frame bags: (per-frame part, part applied once to the stacked [T, C, H, W] bag),
-    so every frame of a bag gets the same flip/rotation/jitter; 'degrade' stays per frame."""
+    so every frame of a bag gets the same flip/rotation/jitter/zoom; 'degrade' stays per frame."""
     frame = [v2.ToImage(), v2.Resize((img_size, img_size), antialias=True)]
-    bag = []
+    bag = [_train_resize(img_size, train_zoom)] if train_zoom else []
     noise = []
     if complex_augs:
         jpeg, blur, noise = _degrade_augs(extra_augs)
@@ -245,11 +263,12 @@ def make_bag_train_transforms_dino(img_size, complex_augs, extra_augs=(), clahe=
     return v2.Compose(frame), v2.Compose(bag)
 
 
-def make_val_transform_dino(img_size, complex_augs, clahe=True):
+def make_val_transform_dino(img_size, complex_augs, clahe=True, zoom=1.0):
+    """zoom > 1: center zoom-in (_val_resize); the default 1.0 keeps the plain resize (SSL probe, clustering)."""
     if complex_augs:
         return v2.Compose([
             v2.ToImage(),
-            v2.Resize((img_size, img_size), antialias=True),
+            *_val_resize(img_size, zoom),
 
             *([v2.Lambda(apply_clahe_cv2_dino)] if clahe else []),
 
@@ -263,7 +282,7 @@ def make_val_transform_dino(img_size, complex_augs, clahe=True):
     else:
         return v2.Compose([
             v2.ToImage(),
-            v2.Resize((img_size, img_size), antialias=True),
+            *_val_resize(img_size, zoom),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),)
         ])

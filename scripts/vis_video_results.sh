@@ -16,6 +16,8 @@ cd ..
 #   default: the 2026-10-27 *_pgl runs (hardcoded run dirs below, data/stratified_splits_paxos2025_patient_q5).
 # Older evaluations (video-level splits, 2026-09/10 checkpoints) are in git history.
 SPLITS=(${SPLITS:-1 2 3 4 5})
+# Zoom (default in train/eval since 2026-11-12): all runs here predate it, so --no_zoom unless ZOOM=1 (runs trained with zoom).
+ZOOM_ARG=$([ -n "$ZOOM" ] && echo "" || echo --no_zoom)
 
 # Patient-level q5 splits (2026-10-27 *_pgl runs: data/stratified_splits_paxos2025_patient_q5, wd 0), 6 models.
 # CKPT=best (default) -> data/multi_eval_paxos2025_patient_q5_best, CKPT=last -> ..._q5_last. Afterwards: referable-DR CSVs
@@ -88,7 +90,7 @@ python -u -m dino.vis_video_results \
       --model DINO_FT transformer $(xdom transformer/models dino_ft_sparse sa_model.pth) \
       --model CNX convnext_transformer $(xdom convnext/models cnx_sparse sa_model.pth); fi) \
   --img_size 512 \
-  --complex_augs $([ -n "$CROP" ] && echo --crop_borders || echo --no_crop_borders) ${NOCLAHE:+--no_clahe}
+  $ZOOM_ARG --complex_augs $([ -n "$CROP" ] && echo --crop_borders || echo --no_crop_borders) ${NOCLAHE:+--no_clahe}
 fi
 elif [ -n "$PGCW" ]; then
 # *_pgcw (scripts/train_pgcw.sh): *_pgl HPs + --sampler_power 0.5 --class_weight_power 0.5 --crop_borders, so evaluated
@@ -116,7 +118,7 @@ python -u -m dino.vis_video_results \
   $([[ $PMODELS == *" cnxp "* ]] && echo --model CNX convnext_transformer $(pgcw convnext/models cnx_sparse_$PTAG sa_model.pth)) \
   $([[ $PMODELS == *" cnx "* ]] && echo --model CNX_mix convnext_transformer $(pgcw convnext/models cnx_sparse_mixed_$PTAG sa_model.pth)) \
   --img_size 512 \
-  --complex_augs $([ -n "$CROP" ] && echo --crop_borders || echo --no_crop_borders) ${EVAL_ARGS}
+  $ZOOM_ARG --complex_augs $([ -n "$CROP" ] && echo --crop_borders || echo --no_crop_borders) ${EVAL_ARGS}
 fi
 elif [ -z "$ANALYSE_ONLY" ]; then
 python -u -m dino.vis_video_results \
@@ -133,7 +135,7 @@ python -u -m dino.vis_video_results \
   --model CNX convnext_transformer $(ckpts sa_model.pth "${CNX_PGL[@]}") \
   --model CNX_mix convnext_transformer $(ckpts sa_model.pth "${CNX_MIX_PGL[@]}") \
   --img_size 512 \
-  --complex_augs \
+  $ZOOM_ARG --complex_augs \
   --no_crop_borders
 fi
 

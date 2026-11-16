@@ -8,7 +8,7 @@ import argparse
 from data.dataset import MILVideoDataset
 from dino.utils import make_train_transform_dino, make_bag_train_transforms_dino, make_val_transform_dino, EXTRA_AUGS
 from misc.training import (seed_everything, make_run_dir, video_search_dirs, make_balanced_loaders,
-                           make_optimizer, EpochLogger, SELECTION_METRICS, make_criterion, add_balancing_args)
+                           make_optimizer, EpochLogger, SELECTION_METRICS, make_criterion, add_balancing_args, zoom_settings)
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
 from transformer.adapters import ADAPTERS
 from transformer.model import AGGREGATION_MODES
@@ -63,11 +63,14 @@ def train_convnext_transformer(args):
 
     # --- Data ---
     # --bag_consistent_augs: random augs drawn once per bag instead of once per frame.
+    zoom, train_zoom = zoom_settings(args)
     if args.bag_consistent_augs:
-        train_trans, train_bag_trans = make_bag_train_transforms_dino(args.img_size, args.complex_augs, args.extra_augs, args.clahe)
+        train_trans, train_bag_trans = make_bag_train_transforms_dino(args.img_size, args.complex_augs, args.extra_augs, args.clahe,
+                                                                      train_zoom=train_zoom)
     else:
-        train_trans, train_bag_trans = make_train_transform_dino(args.img_size, args.complex_augs, args.extra_augs, args.clahe), None
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, args.clahe)
+        train_trans, train_bag_trans = make_train_transform_dino(args.img_size, args.complex_augs, args.extra_augs, args.clahe,
+                                                                 train_zoom=train_zoom), None
+    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, args.clahe, zoom=zoom)
     train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
                            num_frames=args.num_frames,
                            transform=train_trans,

@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from data.dataset import MILVideoDataset, crop_black_borders
 from dino.utils import make_val_transform_dino
+from misc.training import add_zoom_args, zoom_settings
 from dino.train_dino_transformer import DinoSelfAttention
 from dino.train_dino_classifier import DinoClassifier
 from convnext.model import ConvNextSelfAttention
@@ -275,7 +276,7 @@ def parse_models(model_args, splits):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, args.clahe)
+    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, args.clahe, zoom=zoom_settings(args)[0])
 
     num_classes = 1 if args.binary_classification else args.num_classes
     models = parse_models(args.model, args.splits)
@@ -379,6 +380,7 @@ if __name__ == "__main__":
                         help='Trim black frame borders for all models (default; must match training).')
     parser.add_argument('--no_crop_borders', dest='crop_borders', action='store_false',
                         help='Keep black borders (models trained before 2026-11-01 / with --no_crop_borders).')
+    add_zoom_args(parser)  # default center zoom 1.1 (runs since 2026-11-12); --no_zoom for earlier runs
     parser.add_argument('--eval_frames', type=int, default=32, help="Frames per bag for the video models.")
     parser.add_argument('--eval_bags', type=int, default=1,
                         help="> 1: average K seeded random-segment bags per video instead of one uniform bag.")

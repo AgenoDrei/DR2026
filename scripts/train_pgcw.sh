@@ -9,6 +9,8 @@
 # EXTRA: appended to every job (overrides earlier args, e.g. EXTRA="--distance_scale_weight 0").
 # BW: --backbone_weights for the classifier jobs only (SSL-adapted backbone, dino/ssl_lora.py); DINO transformers inherit it.
 # Other split dir: SP=data/stratified_splits_paxos2025_patient_q5_v2 TAG=pgv2 NEW="" bash train_pgcw.sh (current defaults, crop on).
+# CLF_EXTRA: appended to the classifier jobs only (e.g. CLF_EXTRA="--dense_adapter linear_max").
+# CLFTAG: init the transformers from the clf_$CLFTAG classifiers (default: $TAG), e.g. a second transformer variant on existing classifiers.
 # Current dataset (2026-11-12): SP=data/stratified_splits_paxos2025_patient_q5_v3 TAG=<tag> bash train_pgcw.sh
 SPLITS=(${SPLITS:-1 2 3 4 5})
 MAX_GPUS=${MAX_GPUS:-5}
@@ -21,6 +23,8 @@ tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
 mkdir -p dino/logs convnext/logs results
 SP=${SP:-data/stratified_splits_paxos2025_patient_q5}
 EXTRA=${EXTRA:-}
+CLF_EXTRA=${CLF_EXTRA:-}
+CLFTAG=${CLFTAG:-$TAG}
 BW=${BW:-}  # backbone weights for the classifier (e.g. dino/ssl_lora/<run>/merged_backbone.pth); transformers inherit them
 
 new=${NEW-"--sampler_power 0.5 --class_weight_power 0.5 --crop_borders"}
@@ -31,7 +35,7 @@ JOBS=()  # name|split|log dir|python -m args
 for s in "${SPLITS[@]}"; do
   JOBS+=("clf|$s|dino|dino.train_dino_classifier --split_path $SP/split_$s --lr 5e-6 --batch_size 2 --epochs 15 \
  --img_size 512 --complex_augs --lr_schedule cosine --min_lr 1e-7 --distance_scale_weight 0.2 --weight_decay 0.0 $new \
- ${BW:+--backbone_weights $BW} --run_tag clf_$TAG")
+ ${BW:+--backbone_weights $BW} $CLF_EXTRA --run_tag clf_$TAG")
 done
 for s in "${SPLITS[@]}"; do
   JOBS+=("dft|$s|dino|dino.train_dino_transformer --classifier_checkpoint CLF --split_path $SP/split_$s $common $new \
@@ -60,8 +64,8 @@ for job in "${JOBS[@]}"; do
   IFS='|' read -r name s pkg cmd <<< "$job"
   [[ " $ONLY " == *" $name "* ]] || continue
   if [[ $cmd == *" CLF "* ]]; then
-    until grep -q "_split_${s}_full_clf_$TAG," results/run_results.csv; do sleep 60; done
-    ckpt=$(ls -d classifier/models/*_split_${s}_full_clf_$TAG | tail -1)/best_model.pth
+    until grep -q "_split_${s}_full_clf_$CLFTAG," results/run_results.csv; do sleep 60; done
+    ckpt=$(ls -d classifier/models/*_split_${s}_full_clf_$CLFTAG | tail -1)/best_model.pth
     [ -f "$ckpt" ] || { echo "missing $ckpt"; exit 1; }
     cmd=${cmd/ CLF / $ckpt }
   fi
@@ -69,7 +73,7 @@ for job in "${JOBS[@]}"; do
   win=${name}_${TAG}_s$s
   log=$pkg/logs/${win}_$(date +%Y-%m-%d_%H-%M).log
   tmux new-window -d -t "$SESSION" -n "$win" -c "$PWD" \
-    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd $EXTRA 2>&1 | tee $log; exec bash"
+    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd $EXTRA 2>&1 | tee $log; exec env TMOUT=3600 bash"
   echo "$(date '+%m-%d %H:%M') launched $win -> $log"
   sleep 90  # let the run claim its card before the next check
 done

@@ -72,6 +72,7 @@ Settings are passed as environment variables (documented at the top of each scri
 | `vis_video_results.sh` | per-video predictions + metrics/ROC reports (`PGCW=1`, `XDOM=1` modes) |
 | `vis_attention.sh`, `vis_classifier_attention.sh` | attention / occlusion plots |
 | `extract_inf_frames_Paxos20{25,20}.sh`, `segment*.sh`, `classify_frames.sh`, `cropped_frames.sh`, `cluster_frames_paxos2025.sh` | preprocessing stages |
+| `train_adafocus.sh` | Uni-AdaFocus (`adafocus/`): policy-selected frames/patches → frozen DINOv3 ViT-L (`GLOBAL=`, `FT=1`) |
 | `train_ssl_lora.sh`, `train_retfound_transformer.sh` | SSL domain adaptation / RETFound backbone experiments |
 | `train_dino_transformer_baseline.sh`, `_dense.sh` | historical baseline v2 (old video-level splits) |
 
@@ -88,6 +89,6 @@ CLF=classifier/models/<run>/best_model.pth SPLIT=1 TAG=v3 sbatch train_dino_tran
 
 Cross-domain: `XTAG=xdom SEEDS="42 43 44" bash train_xdomain.sh`, then `XDOM=1 XTAG=xdom XDOM_SEEDS="42 43 44" CROP=1 sbatch vis_video_results.sh`.
 
-Outputs: checkpoints in `classifier/models/`, `transformer/models/`, `convnext/models/` (`best_*.pth` = reported, `last_*.pth`),
+Outputs: checkpoints in `classifier/models/`, `transformer/models/`, `convnext/models/`, `adafocus/models/` (`best_*.pth` = reported, `last_*.pth`),
 TensorBoard logs in `runs/`, one summary row per run in `results/run_results.csv`.
 Metrics: QWK, accuracy, macro F1, referable-DR (grade ≥ 2) recall, ROC-AUC.

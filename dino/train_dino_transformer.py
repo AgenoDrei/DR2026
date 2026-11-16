@@ -9,8 +9,8 @@ from data.dataset import MILVideoDataset
 from .utils import (make_train_transform_dino, make_bag_train_transforms_dino, make_val_transform_dino, load_backbone, BACKBONES, EXTRA_AUGS,
                     load_backbone_from_classifier, freeze_module)
 from misc.training import (seed_everything, make_run_dir, video_search_dirs, make_balanced_loaders,
-                           make_optimizer, EpochLogger, SELECTION_METRICS, make_criterion, add_balancing_args)
-from transformer.adapters import ADAPTERS, build_adapter
+                           make_optimizer, EpochLogger, SELECTION_METRICS, make_criterion, add_balancing_args, zoom_settings)
+from transformer.adapters import ADAPTERS, build_adapter, retina_patch_mask
 from transformer.model import AGGREGATION_MODES, BagTransformer
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
 
@@ -47,6 +47,9 @@ class DinoSelfAttention(BagTransformer):
             dense_tokens=None,
             adapter_dim=1024,
             adapter_pe=True,
+            adapter_heads=4,
+            head_dim=None,
+            pool_temp=None,
             classifier_checkpoint_path=None,
             full_checkpoint_path=None,
             backbone="dinov3",
@@ -67,11 +70,12 @@ class DinoSelfAttention(BagTransformer):
             dim, tokens_per_frame = self.backbone.embed_dim, 1
         else:
             self.adapter = build_adapter(dense_adapter, self.backbone.embed_dim, adapter_dim, dense_tokens,
-                                         adapter_pe)
+                                         adapter_pe, num_heads=adapter_heads)
             dim, tokens_per_frame = adapter_dim, self.adapter.tokens_per_frame
         self._build_head(dim, num_heads, ffn_dim, dropout, num_blocks, num_frames,
                          num_classes, aggregation_mode, num_query_tokens, use_pos_embedding=use_pos_embedding,
-                         final_norm=dense_adapter is not None, tokens_per_frame=tokens_per_frame)
+                         final_norm=dense_adapter is not None, tokens_per_frame=tokens_per_frame,
+                         head_dim=head_dim, pool_temp=pool_temp)
         print(
             f"--- DINO Self-Attention [{self.L} features, {self.num_blocks} block(s), "
             f"{f'dense={dense_adapter} ({tokens_per_frame} token(s)/frame), ' if dense_adapter else ''}"
@@ -105,7 +109,10 @@ class DinoSelfAttention(BagTransformer):
         # adapter's [num_frames, (K,) L] tokens from the patch grid.
         if self.adapter is None:
             return self.backbone.forward_features(x)["x_norm_clstoken"]
-        return self.adapter(self.backbone_feature_map(x))
+        fmap = self.backbone_feature_map(x)
+        if getattr(self.adapter, "uses_mask", False):
+            return self.adapter(fmap, retina_patch_mask(x, x.size(-1) // fmap.size(-1)))
+        return self.adapter(fmap)
 
 
 def train_self_attention(args):
@@ -120,6 +127,10 @@ def train_self_attention(args):
                 f"{f'_{args.aggregation_mode}' if args.aggregation_mode != 'cls' else ''}"
                 f"{f'_dense-{args.dense_adapter}{args.dense_tokens or ""}' if args.dense_adapter else ''}"
                 f"{'_nope' if args.no_adapter_pe else ''}"
+                f"{f'_h{args.adapter_heads}' if args.adapter_heads != 4 else ''}"
+                f"{f'_alr{args.adapter_lr_mult:g}' if args.adapter_lr_mult != 1 else ''}"
+                f"{f'_hd{args.head_dim}' if args.head_dim else ''}"
+                f"{f'_pt{args.pool_temp:g}' if args.pool_temp else ''}"
                 f"{'_noclf' if args.classifier_checkpoint is None else ''}"
                 f"{'_aug-' + '-'.join(args.extra_augs) if args.extra_augs else ''}"
                 f"{f'_bag{args.min_bag_size}' if args.min_bag_size else ''}"
@@ -143,6 +154,9 @@ def train_self_attention(args):
         dense_tokens=args.dense_tokens,
         adapter_dim=args.adapter_dim,
         adapter_pe=not args.no_adapter_pe,
+        adapter_heads=args.adapter_heads,
+        head_dim=args.head_dim,
+        pool_temp=args.pool_temp,
         num_classes=1 if args.binary_classification else 5,
         backbone=args.backbone,
         backbone_img_size=args.backbone_img_size,
@@ -157,11 +171,14 @@ def train_self_attention(args):
 
     # --- Data ---
     # --bag_consistent_augs: random augs drawn once per bag instead of once per frame.
+    zoom, train_zoom = zoom_settings(args)
     if args.bag_consistent_augs:
-        train_trans, train_bag_trans = make_bag_train_transforms_dino(args.img_size, args.complex_augs, args.extra_augs)
+        train_trans, train_bag_trans = make_bag_train_transforms_dino(args.img_size, args.complex_augs, args.extra_augs,
+                                                                      train_zoom=train_zoom)
     else:
-        train_trans, train_bag_trans = make_train_transform_dino(args.img_size, args.complex_augs, args.extra_augs), None
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
+        train_trans, train_bag_trans = make_train_transform_dino(args.img_size, args.complex_augs, args.extra_augs,
+                                                                 train_zoom=train_zoom), None
+    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, zoom=zoom)
     search_dir_paths = video_search_dirs(args.fused_dataset)
     train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
                            num_frames=args.num_frames,
@@ -180,7 +197,8 @@ def train_self_attention(args):
     # Class weights only in the training loss; validation loss stays unweighted.
     train_criterion = make_criterion(train_ds, args.binary_classification, args.class_weight_power).to(device)
     criterion = nn.BCEWithLogitsLoss() if args.binary_classification else nn.CrossEntropyLoss()
-    optimizer = make_optimizer(model, args.lr, args.backbone_lr_mult, args.optimizer, args.weight_decay)
+    optimizer = make_optimizer(model, args.lr, args.backbone_lr_mult, args.optimizer, args.weight_decay,
+                               adapter_lr_mult=args.adapter_lr_mult, pool_lr_mult=args.pool_lr_mult)
     if args.lr_schedule == 'cosine':
         # Per-epoch cosine decay down to min_lr (same as convnext/train_convnext_transformer.py).
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
@@ -260,6 +278,17 @@ def build_parser():
                         help='--dense_adapter output dim = transformer width.')
     parser.add_argument('--no_adapter_pe', action='store_true',
                         help='Drop the 2D sin/cos PE in the linear_attnpool dense adapter (content-only pooling).')
+    parser.add_argument('--adapter_heads', type=int, default=4,
+                        help='Attention heads of the linear_attnpool dense adapter.')
+    parser.add_argument('--head_dim', type=int, default=None,
+                        help='Project frame tokens to this width (LayerNorm + Linear + dropout) before the transformer blocks; '
+                             'set --num_heads/--ffn_dim to match (e.g. 384 / 6 / 768).')
+    parser.add_argument('--pool_temp', type=float, default=None,
+                        help='sparse_pool: learnable score temperature, initialized at this value (e.g. 10); off by default.')
+    parser.add_argument('--pool_lr_mult', type=float, default=1.0,
+                        help='sparse_pool scorer (+ temperature) lr = lr * this (own param group).')
+    parser.add_argument('--adapter_lr_mult', type=float, default=1.0,
+                        help='Dense adapter lr = lr * this (own param group).')
     parser.add_argument('--backbone_lr_mult', type=float, default=0.1,
                         help='Backbone LR = --lr * this (only matters when --freeze_backbone is omitted).')
     parser.add_argument('--attn_entropy_weight', type=float, default=0.0,

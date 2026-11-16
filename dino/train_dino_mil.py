@@ -8,7 +8,7 @@ from data.dataset import MILVideoDataset
 from .utils import (make_train_transform_dino, make_val_transform_dino, load_dino_backbone,
                     load_backbone_from_classifier, freeze_module, make_mlp_head)
 from misc.training import (seed_everything, make_run_dir, video_search_dirs, make_balanced_loaders,
-                           make_optimizer, EpochLogger, make_criterion, add_balancing_args)
+                           make_optimizer, EpochLogger, make_criterion, add_balancing_args, zoom_settings)
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
 
 
@@ -99,8 +99,9 @@ def train_mil(args):
                     freeze_backbone=args.freeze_backbone).to(device)
 
     # --- Data ---
-    train_trans = make_train_transform_dino(args.img_size, args.complex_augs)
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
+    zoom, train_zoom = zoom_settings(args)
+    train_trans = make_train_transform_dino(args.img_size, args.complex_augs, train_zoom=train_zoom)
+    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, zoom=zoom)
     search_dir_paths = video_search_dirs(args.fused_dataset)
     train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
                                num_frames=32,
