@@ -176,7 +176,6 @@ def main():
 
         # PASS 1: Analysis (batched)
         frame_results = []
-        global_max_dim = 0
         amp_ctx = lambda: torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda'))
 
         with tqdm(total=total_f, desc=f"Analysis: {vid_id}", leave=False) as pbar:
@@ -213,7 +212,6 @@ def main():
                     x1, y1, x2, y2 = box
                     cx, cy, size = (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1)
                     per_frame_info[bi] = (clean_mask, cx, cy, size)
-                    global_max_dim = max(global_max_dim, size)
                     masked = cv2.bitwise_and(batch_frames[bi], batch_frames[bi], mask=clean_mask)
                     crop = crop_and_pad(masked, cx, cy, size)
                     if crop.size > 0:
@@ -247,8 +245,10 @@ def main():
         print(f"{vid_id}: {len(informative_idx_set)}/{len(frame_results)} informative frames ({status})")
 
         # PASS 2: Export Cropped Video (informative frames only)
-        if global_max_dim > 0 and len(informative_idx_set) > 0:
-            final_sz = int(global_max_dim)
+        informative_sizes = [res['size'] for res in frame_results
+                             if res['f'] in informative_idx_set and res['mask'] is not None]
+        final_sz = int(max(informative_sizes)) if informative_sizes else 0
+        if final_sz > 0 and len(informative_idx_set) > 0:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(str(out_vid_path), fourcc, fps, (final_sz, final_sz))
             for res in frame_results:
