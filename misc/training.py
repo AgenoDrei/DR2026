@@ -16,6 +16,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
+from dino.utils import TRAIN_ZOOM
 from misc.utils import save_confusion_matrix
 
 
@@ -91,25 +92,25 @@ class WeightedCrossEntropy(nn.Module):
 
 
 def add_balancing_args(parser):
-    """--sampler_power, --class_weight_power (defaults = the old behavior), --crop_borders (on by default since 2026-11-01), zoom (add_zoom_args)."""
-    parser.add_argument('--sampler_power', type=float, default=1.0,
+    """--sampler_power, --class_weight_power, --crop_borders (default on) and zoom (add_zoom_args)."""
+    parser.add_argument('--sampler_power', type=float, default=0.5,
                         help='Oversampling by class count ** -p: 1 = fully balanced, 0.5 = sqrt-balanced, 0 = none.')
-    parser.add_argument('--class_weight_power', type=float, default=0.0,
+    parser.add_argument('--class_weight_power', type=float, default=0.5,
                         help='Loss class weights count ** -p (5-class: mean 1 over train samples; binary: pos_weight). 0 = unweighted.')
     parser.add_argument('--crop_borders', action='store_true', default=True,
                         help='Trim black frame borders (data.dataset.crop_black_borders) before resizing (default).')
     parser.add_argument('--no_crop_borders', dest='crop_borders', action='store_false',
-                        help='Keep the black borders (all runs before 2026-11-01).')
+                        help='Keep the black borders.')
     add_zoom_args(parser)
 
 
 def add_zoom_args(parser):
-    """--zoom (eval center zoom, default 1.1) / --train_zoom LO HI (random zoom + shift, default 1.05 1.4), on by default
-    since 2026-11-12; --no_zoom = the plain resize of all earlier runs (evaluate those with --no_zoom too)."""
+    """--zoom (eval center zoom, default 1.1) / --train_zoom LO HI (random zoom + shift, default 1.05 1.3);
+    --no_zoom = plain resize in train and val (evaluate such runs with --no_zoom too)."""
     parser.add_argument('--zoom', type=float, default=1.1, help='Val/eval center zoom-in factor (1 = none).')
-    parser.add_argument('--train_zoom', type=float, nargs=2, default=[1.05, 1.4], metavar=('LO', 'HI'),
+    parser.add_argument('--train_zoom', type=float, nargs=2, default=list(TRAIN_ZOOM), metavar=('LO', 'HI'),
                         help='Train zoom-in range; the crop is placed at a random position (spatial shift).')
-    parser.add_argument('--no_zoom', action='store_true', help='No zoom in train or val (all runs before 2026-11-12).')
+    parser.add_argument('--no_zoom', action='store_true', help='No zoom in train or val.')
 
 
 def zoom_settings(args):
@@ -136,11 +137,8 @@ def make_criterion(train_ds, binary_classification, class_weight_power=0.0):
     return WeightedCrossEntropy(torch.tensor(weight, dtype=torch.float32))
 
 
-def make_optimizer(model, lr, backbone_lr_mult=None, optimizer="adamw", weight_decay=0.001, adapter_lr_mult=1.0,
-                   pool_lr_mult=1.0):
-    """AdamW (default since 2026-10-26; Adam before) over the trainable params. With backbone_lr_mult, the backbone gets
-    its own group at lr * backbone_lr_mult; with adapter_lr_mult / pool_lr_mult != 1, model.adapter / the sparse_pool
-    scorer (pool_score + pool_log_temp) get one at lr * mult.
+def make_optimizer(model, lr, backbone_lr_mult=None, weight_decay=0.0):
+    """AdamW over the trainable params. With backbone_lr_mult, the backbone gets its own group at lr * backbone_lr_mult.
     param_groups[0] is always the head group."""
     if backbone_lr_mult is None:
         param_groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": lr}]
@@ -151,19 +149,12 @@ def make_optimizer(model, lr, backbone_lr_mult=None, optimizer="adamw", weight_d
         param_groups = [{"params": head_params, "lr": lr}]
         if backbone_params:
             param_groups.append({"params": backbone_params, "lr": lr * backbone_lr_mult})
-    extra = [(adapter_lr_mult, [getattr(model, "adapter", None)]),
-             (pool_lr_mult, [getattr(model, "pool_score", None), getattr(model, "pool_log_temp", None)])]
-    for mult, parts in extra:
-        params = [p for part in parts if part is not None
-                  for p in ([part] if isinstance(part, nn.Parameter) else part.parameters()) if p.requires_grad]
-        if mult == 1.0 or not params:
-            continue
-        ids = {id(p) for p in params}
-        param_groups[0]["params"] = [p for p in param_groups[0]["params"] if id(p) not in ids]
-        param_groups.append({"params": params, "lr": lr * mult})
-    if optimizer == "adamw":
-        return optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
-    return optim.Adam(param_groups, lr=lr)
+    return optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+
+
+def make_cosine_scheduler(optimizer, epochs, min_lr=1e-7):
+    """Per-epoch cosine decay of every param group down to min_lr."""
+    return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
 
 
 SELECTION_METRICS = ("default", "combined")

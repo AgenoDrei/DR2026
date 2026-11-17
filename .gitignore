@@ -35,3 +35,4 @@ data/multi_eval_paxos2025_binary/
 tmp/
 occlusion_results/
 transformer_attention_analysis/
+data/cls_cache/

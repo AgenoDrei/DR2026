@@ -26,7 +26,7 @@ python -u -m adafocus.train_adafocus \
   --split_path "$SP/split_$SPLIT" \
   --global_encoder "$GLOBAL" --local_encoder "$LOCAL" \
   --epochs 20 --lr 1e-4 --min_lr 1e-7 \
-  --img_size 512 --complex_augs --random_segment_sample \
+  --img_size 512 --random_segment_sample \
   --num_frames 64 --num_glance 32 --num_focus 16 --patch_size 224 \
   --distance_scale_weight 0.3 --selection_metric combined \
   --sampler_power 0.5 --class_weight_power 0.5 \

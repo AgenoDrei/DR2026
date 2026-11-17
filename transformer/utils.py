@@ -3,17 +3,12 @@ import numpy as np
 from tqdm import tqdm
 from misc.utils import binary_metrics, multiclass_metrics
 
-def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classification, device, scaler=None, entropy_weight=0.0, distance_scale_weight=0.0):
+def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classification, device, scaler=None, distance_scale_weight=0.0):
     """
     Trains one epoch of the Transformer sequence aggregator model.
 
     Uses autocast + a GradScaler when `scaler` is given (needed to fit the
     unfrozen ViT-L backbone's activations over a frame bag in 24GB).
-
-    entropy_weight > 0 adds an entropy-minimization term on the CLS->frame
-    attention weights: H(w) = -sum(w_i * log(w_i)), added to the loss so
-    gradient descent pushes attention toward a peakier (lower-entropy, more
-    selective) distribution over frames instead of a diffuse/uniform one.
 
     distance_scale_weight > 0 rescales the classification loss itself by
     1 + distance_scale_weight * |pred_grade - true_grade| (pred_grade taken
@@ -26,7 +21,6 @@ def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classifica
     """
     model.train()
     total_loss = 0
-    total_entropy = 0
     use_amp = scaler is not None and device.type == "cuda"
 
     for sequence, label, grade in tqdm(loader, desc="Training"):
@@ -40,8 +34,7 @@ def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classifica
         optimizer.zero_grad()
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            # Model returns (logits, frame_attention_weights)
-            logits, weights = model(sequence)
+            logits, _ = model(sequence)
             loss = criterion(logits, target)
 
             if distance_scale_weight > 0 and not binary_classification:
@@ -50,10 +43,6 @@ def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classifica
                     distance = (pred_grade - target).abs().float()
                     scale = 1.0 + distance_scale_weight * distance
                 loss = loss * scale.squeeze()
-
-            entropy = -(weights.float() * torch.log(weights.float() + 1e-12)).sum()
-            if entropy_weight > 0:
-                loss = loss + entropy_weight * entropy
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -64,9 +53,8 @@ def train_one_epoch_trans(model, loader, criterion, optimizer, binary_classifica
             optimizer.step()
 
         total_loss += loss.item()
-        total_entropy += entropy.item()
 
-    return total_loss / len(loader), total_entropy / len(loader)
+    return total_loss / len(loader)
 
 
 def validate_extended_trans(model, loader, criterion, binary_classification, device):
