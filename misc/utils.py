@@ -107,9 +107,11 @@ def save_confusion_matrix(y_true, y_pred, epoch, run_dir, class_names=None):
 
 def apply_clahe_cv2(img_pil):
     img_np = np.array(img_pil)
+    valid = img_np.max(axis=2) > 0
     lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    return Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB))
+    out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
+    out[~valid] = 0
+    return Image.fromarray(out)

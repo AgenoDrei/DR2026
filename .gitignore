@@ -1,25 +1,46 @@
+# Analysis and project directories
 binary_transformer_attention_analysis/
-classifier/frames_sampled/
+
+# Classifier
 classifier/cropped_classifier_frames/
+classifier/frames_sampled/
 classifier/models/
+
+# ConvNeXt
+convnext/logs/
+convnext/models/
+
+# Cropping
 cropping/frames_to_annotate_larger/
 cropping/models/
+cropping/train_vis/
+
+# Data
 data/2024_Paxos_Frames
+data/attention_errors_cnx/
 data/dr_videos
-data/ensemble_results_*/
-data/informative_frames/
-data/stratified_splits/split_*/
+data/ensemble_results_*
+data/informative_frames
 data/matched_frames/
+data/multi_eval_paxos2025_binary/
 data/results/
+data/stratified_splits/split_*/
+
+# DINO
 dino/dinov3/
+dino/logs/
+
+# Informative frames
 informative_frames/models/
+informative_frames/train_vis/
+
+# MIL
 mil/models/
+
+# Transformer
 transformer/models/
-*.pt
-*.pth
-*.ckpt
-convnext/models/
-convnext/logs/
+
+# Experiment outputs
 runs/
 CLAUDE.md
 .vscode/
@@ -30,9 +51,26 @@ adafocus/logs/
 results/*.lock
 results/*.tmp
 **/notes
-data/attention_errors_cnx/
-data/multi_eval_paxos2025_binary/
 tmp/
 occlusion_results/
 transformer_attention_analysis/
+
+# Model checkpoints
+*.ckpt
+*.pt
+*.pth
+
+# Logs and scheduler outputs
+*.log
+slurm*.out
+
+# IDE and editor settings
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+
+# Notes and project-specific files
+CLAUDE.md
 data/cls_cache/

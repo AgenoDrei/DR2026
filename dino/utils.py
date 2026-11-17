@@ -68,7 +68,11 @@ def apply_clahe_cv2_dino(img):
     if img.dtype != np.uint8:
         img = (img * 255).astype(np.uint8)
 
+    img = np.ascontiguousarray(img)
+    valid = img.max(axis=2) > 8
+
     img = clahe_rgb(img)
+    img[~valid] = 0
     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 
