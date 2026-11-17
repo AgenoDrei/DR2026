@@ -6,11 +6,11 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 
-# Paxos2025 production pipeline: score every video in data/dr_videos with the
+# Paxos2025 production pipeline: score the 302 q5_v3 videos in data/dr_videos with the
 # 5-fold seg + cls models (per video, the fold model of its val fold from
-# cropping/splits.json -- never trained on that video; unknown videos get the
+# the seg/cls training split CSVs -- never trained on that video; unknown videos get the
 # full 5-fold probability ensembles) and write the cleaned clips,
-# per-frame probability txt files and plots to data/ensemble_results_paxos2025/.
+# per-frame probability txt files and plots to data/ensemble_results_paxos2025_q5v3/.
 #
 # Prerequisites: trained checkpoints in cropping/models (seg_fold_<i>.pth)
 # and informative_frames/models (cls_fold_<i>.pth).
@@ -30,4 +30,4 @@ python -u -m informative_frames.extract_inf_frames \
   --video_dir data/dr_videos \
   --seg_model_dir cropping/models \
   --cls_model_dir informative_frames/models \
-  --out_base data/ensemble_results_paxos2025
+  --out_base data/ensemble_results_paxos2025_q5v3

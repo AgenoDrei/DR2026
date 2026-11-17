@@ -65,11 +65,11 @@ python -u -m informative_frames.extract_inf_frames \
   --video_dir data/dr_videos \
   --seg_model_dir cropping/models \
   --cls_model_dir informative_frames/models \
-  --out_base data/ensemble_results_paxos2025
+  --out_base data/ensemble_results_paxos2025_q5v3
 
 echo "Pre-processing finished. Outputs:"
 echo "  cropping/train_vis/                 training-batch plots (fold 0)"
 echo "  cropping/eval/                      cropping metrics + plot"
 echo "  informative_frames/label_plots/     label distribution plots"
 echo "  informative_frames/eval/            classifier metrics + plot"
-echo "  data/ensemble_results_paxos2025/    cleaned videos + per-frame probs + plots"
+echo "  data/ensemble_results_paxos2025_q5v3/    cleaned videos + per-frame probs + plots"

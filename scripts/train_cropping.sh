@@ -32,6 +32,7 @@ for fold in $FOLDS; do
   echo "=== train fold=$fold epochs=$EPOCHS ==="
   python -u -m cropping.train_segmentation \
     --fold "$fold" --epochs "$EPOCHS" \
+    --img_dir "$IMG_DIR" --out_dir "$OUT_DIR" \
     --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" --img_size "$IMG_SIZE" --amp
 done
 
