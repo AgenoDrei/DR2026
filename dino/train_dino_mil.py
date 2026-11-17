@@ -8,7 +8,7 @@ from data.dataset import MILVideoDataset
 from .utils import (make_train_transform_dino, make_val_transform_dino, load_dino_backbone,
                     load_backbone_from_classifier, freeze_module, make_mlp_head)
 from misc.training import (seed_everything, make_run_dir, video_search_dirs, make_balanced_loaders,
-                           make_optimizer, EpochLogger, make_criterion, add_balancing_args)
+                           make_optimizer, EpochLogger, make_criterion, add_balancing_args, zoom_settings)
 from transformer.utils import train_one_epoch_trans, validate_extended_trans
 
 
@@ -90,7 +90,7 @@ def train_mil(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed_everything(args.seed)
 
-    description = (f"dino_mil_{'complex' if args.complex_augs else 'simple'}_{args.split_path.split('/')[-1]}_"
+    description = (f"dino_mil_complex_{args.split_path.split('/')[-1]}_"
                    f"{'segmented' if args.random_segment_sample else 'uniform'}")
     run_name, run_dir = make_run_dir("mil", description, args.run_tag)
 
@@ -99,8 +99,9 @@ def train_mil(args):
                     freeze_backbone=args.freeze_backbone).to(device)
 
     # --- Data ---
-    train_trans = make_train_transform_dino(args.img_size, args.complex_augs)
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
+    zoom, train_zoom = zoom_settings(args)
+    train_trans = make_train_transform_dino(args.img_size, train_zoom=train_zoom)
+    val_trans = make_val_transform_dino(args.img_size, complex_augs=True, zoom=zoom)
     search_dir_paths = video_search_dirs(args.fused_dataset)
     train_ds = MILVideoDataset(os.path.join(args.split_path, args.train_json),
                                num_frames=32,
@@ -118,7 +119,7 @@ def train_mil(args):
     # Class weights only in the training loss; validation loss stays unweighted.
     train_criterion = make_criterion(train_ds, True, args.class_weight_power).to(device)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = make_optimizer(model, args.lr)
+    optimizer = make_optimizer(model, args.lr, weight_decay=0.001)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
     # Mixed precision, as for the transformer, so an unfrozen backbone fits in 24GB.
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -127,7 +128,7 @@ def train_mil(args):
     print(f"Starting MIL Training: {run_name}")
 
     for epoch in range(args.epochs):
-        t_loss, _ = train_one_epoch_trans(model, train_loader, train_criterion, optimizer, True, device, scaler)
+        t_loss = train_one_epoch_trans(model, train_loader, train_criterion, optimizer, True, device, scaler)
         m = validate_extended_trans(model, val_loader, criterion, True, device)
         scheduler.step()
         logger.log_epoch(epoch, model, optimizer, t_loss, m)
@@ -149,7 +150,6 @@ if __name__ == "__main__":
     parser.add_argument('--lr_step', type=int, default=10)
     parser.add_argument('--img_size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--random_segment_sample', action='store_true')
     parser.add_argument('--fused_dataset', action='store_true')
     parser.add_argument('--run_tag', type=str, default=None,

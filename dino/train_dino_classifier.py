@@ -1,40 +1,33 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import os
 import argparse
 
 from data.dataset import FrameDataset
 from classifier.utils import validate_classifier, train_one_epoch_classifier
-from dino.utils import (make_train_transform_dino, make_val_transform_dino, load_dino_backbone, freeze_module,
-                        make_mlp_head, DINO_WEIGHTS, DINO_WEIGHTS_SAT)
-from misc.training import (seed_everything, make_run_dir, make_balanced_loaders, make_optimizer, EpochLogger,
-                           make_criterion, add_balancing_args)
+from dino.utils import make_train_transform_dino, make_val_transform_dino, load_dino_backbone, make_mlp_head
+from misc.training import (seed_everything, make_run_dir, make_balanced_loaders, make_optimizer, make_cosine_scheduler,
+                           EpochLogger, make_criterion, add_balancing_args, zoom_settings)
 
 
 class DinoClassifier(nn.Module):
-    def __init__(self, freeze_backbone=True, num_classes=5, weights=DINO_WEIGHTS):
+    """Unfrozen DINOv3 ViT-L/16 backbone + MLP head on the CLS token."""
+
+    def __init__(self, num_classes=5):
         super().__init__()
-
-        self.backbone = load_dino_backbone(weights)
+        self.backbone = load_dino_backbone()
         self.embed_dim = self.backbone.embed_dim
-
-        if freeze_backbone:
-            freeze_module(self.backbone)
-
         self.head = make_mlp_head(self.embed_dim, num_classes)
 
     @classmethod
-    def from_checkpoint(cls, path, freeze_backbone=True):
+    def from_checkpoint(cls, path):
         """Rebuild from a best_model.pth, reading num_classes (1 = binary, 5) off the head."""
         state_dict = torch.load(path, map_location="cpu")
-        weights = DINO_WEIGHTS_SAT if "backbone.local_cls_norm.weight" in state_dict else DINO_WEIGHTS
-        model = cls(freeze_backbone=freeze_backbone, num_classes=state_dict["head.5.weight"].shape[0], weights=weights)
+        model = cls(num_classes=state_dict["head.5.weight"].shape[0])
         model.load_state_dict(state_dict, strict=True)
         return model
 
     def forward(self, x):
-        # Classify from the DINO CLS token.
         return self.head(self.backbone.forward_features(x)["x_norm_clstoken"])
 
 
@@ -48,21 +41,11 @@ def train_classifier(args):
                 f"{"full" if args.train_json == "frame_train.json" else args.train_json.split(".")[0].split("_")[-1]}")
     run_name, run_dir = make_run_dir("classifier", description, args.run_tag)
 
-    num_classes = 1 if args.binary_classification else 5
-    if args.weight_path:
-        # Pretrained weights are a 5-class DinoClassifier; swap in a fresh head for binary.
-        print(f"Loading pretrained weights from: {args.weight_path}")
-        model = DinoClassifier(freeze_backbone=args.freeze_backbone, num_classes=5, weights=args.backbone_weights)
-        model.load_state_dict(torch.load(args.weight_path, map_location="cpu"))
-        if num_classes != 5:
-            model.head = make_mlp_head(model.embed_dim, num_classes)
-    else:
-        model = DinoClassifier(freeze_backbone=args.freeze_backbone, num_classes=num_classes, weights=args.backbone_weights)
-    model.backbone.grad_checkpointing = args.grad_checkpointing
-    model = model.to(device)
+    model = DinoClassifier(num_classes=1 if args.binary_classification else 5).to(device)
 
-    train_trans = make_train_transform_dino(args.img_size, args.complex_augs)
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
+    zoom, train_zoom = zoom_settings(args)
+    train_trans = make_train_transform_dino(args.img_size, train_zoom=train_zoom)
+    val_trans = make_val_transform_dino(args.img_size, complex_augs=True, zoom=zoom)
     frame_dirs = ["data/2024_Paxos_Frames/cropped_matched_frames"]
     train_dataset = FrameDataset(os.path.join(args.split_path, args.train_json), frame_dirs, transform=train_trans,
                                  crop_borders=args.crop_borders)
@@ -75,11 +58,8 @@ def train_classifier(args):
     # Class weights only in the training loss; validation loss stays unweighted.
     train_criterion = make_criterion(train_dataset, args.binary_classification, args.class_weight_power).to(device)
     criterion = nn.BCEWithLogitsLoss() if args.binary_classification else nn.CrossEntropyLoss()
-    optimizer = make_optimizer(model, args.lr, optimizer=args.optimizer, weight_decay=args.weight_decay)
-    if args.lr_schedule == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
-    else:
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
+    optimizer = make_optimizer(model, args.lr, weight_decay=args.weight_decay)
+    scheduler = make_cosine_scheduler(optimizer, args.epochs, args.min_lr)
 
     logger = EpochLogger(run_name, run_dir, args, args.binary_classification, "best_model.pth",
                          cm_to_tensorboard=True)
@@ -101,31 +81,15 @@ if __name__ == "__main__":
     parser.add_argument('--split_path', type=str, required=True)
     parser.add_argument('--train_json', type=str, default="frame_train.json")
     parser.add_argument('--val_json', type=str, default="frame_val.json")
-    parser.add_argument('--weight_path', type=str, default=None,
-                        help='5-class DinoClassifier checkpoint to initialize from (head is replaced for --binary_classification).')
-    parser.add_argument('--freeze_backbone', action='store_true')
-    parser.add_argument('--backbone_weights', type=str, default=DINO_WEIGHTS,
-                        help='Pretrained DINOv3 ViT-L/16 weights (e.g. dino.utils.DINO_WEIGHTS_SAT, satellite pretraining).')
     parser.add_argument('--binary_classification', action='store_true')
-
     parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--lr_step', type=int, default=10,
-                        help='StepLR step size in epochs (only for --lr_schedule step).')
-    parser.add_argument('--lr_schedule', type=str, default='step', choices=['step', 'cosine'],
-                        help="'step' = StepLR(--lr_step, gamma 0.1), 'cosine' = cosine annealing to --min_lr over --epochs.")
-    parser.add_argument('--min_lr', type=float, default=1e-7,
-                        help='Final LR of the cosine schedule (only for --lr_schedule cosine).')
-    parser.add_argument('--distance_scale_weight', type=float, default=0.0,
-                        help='Distance-Scaled CE weight: loss *= 1 + w*|pred_grade-true_grade| (5-class only). 0 disables.')
+    parser.add_argument('--lr', type=float, default=5e-6)
+    parser.add_argument('--min_lr', type=float, default=1e-7, help='Final LR of the cosine schedule.')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='AdamW weight decay.')
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--img_size', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'])
-    parser.add_argument('--weight_decay', type=float, default=0.001,
-                        help='Only used with --optimizer adamw (decoupled weight decay).')
-    parser.add_argument('--complex_augs', action='store_true')
-    parser.add_argument('--grad_checkpointing', action='store_true',
-                        help='Per-block gradient checkpointing in the backbone (unfrozen bs 16 at 512px: ~7GB instead of OOM on 24GB).')
+    parser.add_argument('--distance_scale_weight', type=float, default=0.2,
+                        help='Distance-Scaled CE weight: loss *= 1 + w*|pred_grade-true_grade| (5-class only). 0 disables.')
     parser.add_argument('--run_tag', type=str, default=None,
                         help='Optional short suffix appended to the run name (e.g. an experiment label).')
     add_balancing_args(parser)

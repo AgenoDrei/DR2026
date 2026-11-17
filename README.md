@@ -58,36 +58,40 @@ Split dirs hold `split_<n>/{mil,frame}_{train,val}.json` (`{filename: grade}`); 
 ## Scripts (`scripts/`)
 
 Two kinds: `#SBATCH` jobs (`cd scripts && sbatch <job>.sh`, or `bash <job>.sh` on a GPU machine) and local queues
-(`train_pgcw.sh`, `train_xdomain.sh`, `train_retfound_transformer.sh`, `train_ssl_lora.sh`) that open one tmux window per run
+(`train_pgcw.sh`, `train_xdomain.sh`, `train_cached_transformer.sh`) that open one tmux window per run
 and need the workstation's `gpu run`/`gpu status` wrapper. Partition names / time limits in `#SBATCH` lines are cluster-specific.
 Settings are passed as environment variables (documented at the top of each script).
 
 | Script | Purpose |
 |---|---|
-| `train_dino_classifier.sh` | frame classifier, one split (`SPLIT=`, `SP=` split dir) |
+| `train_dino_classifier.sh` | frame classifier, one split (`TAG=`, `SPLIT=`, `SP=` split dir, default v3) |
 | `train_dino_transformer.sh` | DINO transformer from a classifier (`CLF=`), frozen or `FT=1` |
 | `train_convnext_transformer.sh` | ConvNeXt-L transformer (`MIXED=1`: + Paxos2020 train videos) |
-| `train_pgcw.sh` | current 5-split recipe, all models (classifier → DINO frozen/FT, ConvNeXt), local queue |
+| `train_pgcw.sh` | current 5-split recipe, all models (classifier → DINO frozen/FT, ConvNeXt, ConvNeXt mix), local queue |
 | `train_xdomain.sh` | cross-domain runs (`SEEDS=`), local queue |
 | `vis_video_results.sh` | per-video predictions + metrics/ROC reports (`PGCW=1`, `XDOM=1` modes) |
 | `vis_attention.sh`, `vis_classifier_attention.sh` | attention / occlusion plots |
-| `extract_inf_frames_Paxos20{25,20}.sh`, `segment*.sh`, `classify_frames.sh`, `cropped_frames.sh`, `cluster_frames_paxos2025.sh` | preprocessing stages |
-| `train_ssl_lora.sh`, `train_retfound_transformer.sh` | SSL domain adaptation / RETFound backbone experiments |
-| `train_dino_transformer_baseline.sh`, `_dense.sh` | historical baseline v2 (old video-level splits) |
+| `extract_inf_frames_Paxos20{25,20}.sh`, `segment*.sh`, `classify_frames.sh`, `cropped_frames.sh` | preprocessing stages |
+| `train_adafocus.sh` | Uni-AdaFocus (`adafocus/`): policy-selected frames/patches → frozen DINOv3 ViT-L (`GLOBAL=`, `FT=1`) |
+| `train_cached_transformer.sh` | head-only transformer runs on cached frozen CLS features (`CONFIGS=` queue file) |
 
 Current recipe on Paxos2025 (5 splits) and its evaluation:
 
 ```bash
 cd scripts
-SP=data/stratified_splits_paxos2025_patient_q5_v3 TAG=v3 bash train_pgcw.sh             # local queue
-PGCW=1 PTAG=v3 Q5_SPLITS=data/stratified_splits_paxos2025_patient_q5_v3 sbatch vis_video_results.sh
+TAG=v3 bash train_pgcw.sh                                                                # local queue
+PGCW=1 PTAG=v3 ZOOM=1 Q5_SPLITS=data/stratified_splits_paxos2025_patient_q5_v3 sbatch vis_video_results.sh
 # SLURM, one split at a time:
 SPLIT=1 TAG=v3 sbatch train_dino_classifier.sh
 CLF=classifier/models/<run>/best_model.pth SPLIT=1 TAG=v3 sbatch train_dino_transformer.sh
 ```
 
-Cross-domain: `XTAG=xdom SEEDS="42 43 44" bash train_xdomain.sh`, then `XDOM=1 XTAG=xdom XDOM_SEEDS="42 43 44" CROP=1 sbatch vis_video_results.sh`.
+Cross-domain: `XTAG=xdom SEEDS="42 43 44" bash train_xdomain.sh`, then `XDOM=1 XTAG=xdom XDOM_SEEDS="42 43 44" CROP=1 ZOOM=1 sbatch vis_video_results.sh`.
 
-Outputs: checkpoints in `classifier/models/`, `transformer/models/`, `convnext/models/` (`best_*.pth` = reported, `last_*.pth`),
+The training scripts' argparse defaults are the current recipe (crop borders, zoom 1.05–1.3 train / 1.1 eval, CLAHE + flip/rotation
+augs, random-segment bags, sparse pooling, cosine LR, sampler/class-weight power 0.5), so the job scripts only pass split, epochs and tag.
+Runs trained before 2026-11-17 used `--no_zoom` or train zoom up to 1.4 (`pgv3` = no zoom); evaluate with the matching flags (`ZOOM=1` only for zoom runs).
+
+Outputs: checkpoints in `classifier/models/`, `transformer/models/`, `convnext/models/`, `adafocus/models/` (`best_*.pth` = reported, `last_*.pth`),
 TensorBoard logs in `runs/`, one summary row per run in `results/run_results.csv`.
 Metrics: QWK, accuracy, macro F1, referable-DR (grade ≥ 2) recall, ROC-AUC.

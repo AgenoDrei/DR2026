@@ -1,57 +1,42 @@
 #!/bin/bash
-# *_pgcw (2026-10-30): the *_pgl runs (patient q5 splits, same HPs) + softer oversampling (--sampler_power 0.5),
-# class-weighted loss (--class_weight_power 0.5) and black-border cropping (--crop_borders).
-# Order: classifier -> DINO FT (init: best classifier of its split) -> ConvNeXt mixed -> DINO frozen -> ConvNeXt (2025 only).
+# Trains the reference models on every split of the current dataset (v3): frame classifier (clf) -> DINO FT (dft) and
+# DINO frozen (dfz), both initialized from the best classifier of their split -> ConvNeXt + Paxos2020 mixing (cnx) and
+# ConvNeXt (cnxp). Hyperparameters are the scripts' defaults.
 # Local queue (not sbatch): each job opens a window in tmux session dr_hiwi_stage2 once this user holds < MAX_GPUS cards.
-# Usage (from scripts/): SPLITS="1 2 3 4 5" bash train_pgcw.sh (ONLY="dfz cnxp": only those job names); evaluate with PGCW=1 sbatch vis_video_results.sh
-# Ablations: TAG=pgc NEW="--crop_borders" ONLY="clf dft cnx" bash train_pgcw.sh (--crop_borders is the default since 2026-11-01;
-# NEW="--no_crop_borders" = plain *_pgl config).
-# EXTRA: appended to every job (overrides earlier args, e.g. EXTRA="--distance_scale_weight 0").
-# BW: --backbone_weights for the classifier jobs only (SSL-adapted backbone, dino/ssl_lora.py); DINO transformers inherit it.
-# Other split dir: SP=data/stratified_splits_paxos2025_patient_q5_v2 TAG=pgv2 NEW="" bash train_pgcw.sh (current defaults, crop on).
-# Current dataset (2026-11-12): SP=data/stratified_splits_paxos2025_patient_q5_v3 TAG=<tag> bash train_pgcw.sh
+# Usage (from scripts/): TAG=<tag> bash train_pgcw.sh; evaluate with PGCW=1 PTAG=<tag> Q5_SPLITS=<SP> ZOOM=1 sbatch vis_video_results.sh
+#   SPLITS="1 2 3 4 5", ONLY="clf dft cnx dfz cnxp" (job names), SP=<split dir>, EXTRA="<args>" (appended to every job),
+#   CLFTAG=<tag>: init the transformers from the clf_<CLFTAG> classifiers (default: $TAG).
 SPLITS=(${SPLITS:-1 2 3 4 5})
 MAX_GPUS=${MAX_GPUS:-5}
 ONLY=${ONLY:-clf dft cnx dfz cnxp}
 SESSION=${SESSION:-dr_hiwi_stage2}
-TAG=${TAG:-pgcw}
+[ -n "$TAG" ] || { echo "set TAG=<run tag> (new tag: the DINO jobs wait for clf_<TAG> in results/run_results.csv)"; exit 1; }
+SP=${SP:-data/stratified_splits_paxos2025_patient_q5_v3}
+EXTRA=${EXTRA:-}
+CLFTAG=${CLFTAG:-$TAG}
 cd "$(dirname "$0")/.."
 command -v gpu >/dev/null || { echo "needs the local 'gpu' wrapper + tmux (GPU workstation); on SLURM use the sbatch scripts"; exit 1; }
 tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
 mkdir -p dino/logs convnext/logs results
-SP=${SP:-data/stratified_splits_paxos2025_patient_q5}
-EXTRA=${EXTRA:-}
-BW=${BW:-}  # backbone weights for the classifier (e.g. dino/ssl_lora/<run>/merged_backbone.pth); transformers inherit them
-
-new=${NEW-"--sampler_power 0.5 --class_weight_power 0.5 --crop_borders"}
-common="--lr 1e-5 --min_lr 1e-7 --weight_decay 0.0 --img_size 512 --complex_augs --num_frames 32 --random_segment_sample \
- --aggregation_mode sparse_pool --num_query_tokens 4 --num_heads 8 --ffn_dim 2048 --dropout 0.1 --selection_metric combined"
 
 JOBS=()  # name|split|log dir|python -m args
 for s in "${SPLITS[@]}"; do
-  JOBS+=("clf|$s|dino|dino.train_dino_classifier --split_path $SP/split_$s --lr 5e-6 --batch_size 2 --epochs 15 \
- --img_size 512 --complex_augs --lr_schedule cosine --min_lr 1e-7 --distance_scale_weight 0.2 --weight_decay 0.0 $new \
- ${BW:+--backbone_weights $BW} --run_tag clf_$TAG")
+  JOBS+=("clf|$s|dino|dino.train_dino_classifier --split_path $SP/split_$s --run_tag clf_$TAG")
 done
 for s in "${SPLITS[@]}"; do
-  JOBS+=("dft|$s|dino|dino.train_dino_transformer --classifier_checkpoint CLF --split_path $SP/split_$s $common $new \
- --lr_schedule cosine --num_blocks 2 --attn_entropy_weight 0.0 --distance_scale_weight 0.3 --backbone_lr_mult 0.1 --epochs 15 \
+  JOBS+=("dft|$s|dino|dino.train_dino_transformer --classifier_checkpoint CLF --split_path $SP/split_$s --epochs 15 \
  --run_tag dino_ft_sparse_$TAG")
 done
-cnx_args="--adapter linear_attnpool --feature_stage 3 --feature_block -1 --epochs 25 --backbone_lr_mult 0.1 --num_blocks 1 \
- --distance_scale_weight 0.2"
 for s in "${SPLITS[@]}"; do
-  JOBS+=("cnx|$s|convnext|convnext.train_convnext_transformer --split_path $SP/split_$s $common $new \
- --train_json mil_train_mixed.json --fused_dataset $cnx_args --run_tag cnx_sparse_mixed_$TAG")
+  JOBS+=("cnx|$s|convnext|convnext.train_convnext_transformer --split_path $SP/split_$s --train_json mil_train_mixed.json \
+ --fused_dataset --run_tag cnx_sparse_mixed_$TAG")
 done
 for s in "${SPLITS[@]}"; do
-  JOBS+=("dfz|$s|dino|dino.train_dino_transformer --classifier_checkpoint CLF --split_path $SP/split_$s $common $new \
- --lr_schedule cosine --num_blocks 2 --attn_entropy_weight 0.0 --distance_scale_weight 0.3 --freeze_backbone --epochs 8 \
- --run_tag dino_sparse_$TAG")
+  JOBS+=("dfz|$s|dino|dino.train_dino_transformer --classifier_checkpoint CLF --split_path $SP/split_$s --freeze_backbone \
+ --epochs 8 --run_tag dino_sparse_$TAG")
 done
 for s in "${SPLITS[@]}"; do
-  JOBS+=("cnxp|$s|convnext|convnext.train_convnext_transformer --split_path $SP/split_$s $common $new $cnx_args \
- --run_tag cnx_sparse_$TAG")
+  JOBS+=("cnxp|$s|convnext|convnext.train_convnext_transformer --split_path $SP/split_$s --run_tag cnx_sparse_$TAG")
 done
 
 mine() { gpu status | grep -c "$USER"; }
@@ -60,8 +45,8 @@ for job in "${JOBS[@]}"; do
   IFS='|' read -r name s pkg cmd <<< "$job"
   [[ " $ONLY " == *" $name "* ]] || continue
   if [[ $cmd == *" CLF "* ]]; then
-    until grep -q "_split_${s}_full_clf_$TAG," results/run_results.csv; do sleep 60; done
-    ckpt=$(ls -d classifier/models/*_split_${s}_full_clf_$TAG | tail -1)/best_model.pth
+    until grep -q "_split_${s}_full_clf_$CLFTAG," results/run_results.csv; do sleep 60; done
+    ckpt=$(ls -d classifier/models/*_split_${s}_full_clf_$CLFTAG | tail -1)/best_model.pth
     [ -f "$ckpt" ] || { echo "missing $ckpt"; exit 1; }
     cmd=${cmd/ CLF / $ckpt }
   fi
@@ -69,7 +54,7 @@ for job in "${JOBS[@]}"; do
   win=${name}_${TAG}_s$s
   log=$pkg/logs/${win}_$(date +%Y-%m-%d_%H-%M).log
   tmux new-window -d -t "$SESSION" -n "$win" -c "$PWD" \
-    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd $EXTRA 2>&1 | tee $log; exec bash"
+    "eval \"\$(conda shell.bash hook)\"; conda activate job_new; gpu run python -u -m $cmd $EXTRA 2>&1 | tee $log; exec env TMOUT=3600 bash"
   echo "$(date '+%m-%d %H:%M') launched $win -> $log"
   sleep 90  # let the run claim its card before the next check
 done

@@ -85,18 +85,14 @@ class FrameDataset(Dataset):
 
 class MILVideoDataset(Dataset):
     def __init__(self, json_path, num_frames=32, transform=None, random_segment_sample=False, search_dir_paths=None,
-                 bag_transform=None, min_bag_size=None, crop_borders=False):
-        """`transform` is applied per frame; optional `bag_transform` once to the stacked [T, C, H, W] bag.
-        min_bag_size (train only): each bag keeps a random sorted subset of k ~ U[min_bag_size, num_frames] sampled frames.
-        crop_borders: trim each frame's black borders (crop_black_borders) before the transform."""
+                 crop_borders=False):
+        """`transform` is applied per frame. crop_borders: trim each frame's black borders (crop_black_borders) before it."""
         self.crop_borders = crop_borders
-        self.min_bag_size = min_bag_size
         with open(json_path, 'r') as f:
             self.label_map = json.load(f)
 
         self.num_frames = num_frames
         self.transform = transform
-        self.bag_transform = bag_transform
         self.random_segment_sample = random_segment_sample
 
         if search_dir_paths is None:
@@ -205,10 +201,6 @@ class MILVideoDataset(Dataset):
             raise RuntimeError(f"Video {path} has 0 frames or unreadable metadata.")
 
         target_indices = self._sample_indices(item, total_frames)
-        if self.min_bag_size is not None:
-            k = np.random.randint(self.min_bag_size, self.num_frames + 1)
-            keep = np.sort(np.random.choice(len(target_indices), k, replace=False))
-            target_indices = [target_indices[j] for j in keep]
         bag_size = len(target_indices)
         target_counts = Counter(target_indices)
 
@@ -255,33 +247,5 @@ class MILVideoDataset(Dataset):
             raise RuntimeError(
                 f"Critical failure: Expected {bag_size} frames from {path}, but ended up with {len(frames)}.")
 
-        bag = torch.stack(frames)
-        bag = self.bag_transform(bag) if self.bag_transform else bag
-        return bag
+        return torch.stack(frames)
 
-
-class KaggleDRDataset(Dataset):
-    def __init__(self, split_dir, transform=None):
-        self.image_paths = []
-        self.labels = []
-        self.transform = transform
-
-        for grade_folder in sorted(os.listdir(split_dir)):
-            grade_path = os.path.join(split_dir, grade_folder)
-            if os.path.isdir(grade_path) and grade_folder.isdigit():
-                grade = int(grade_folder)
-                for img_name in os.listdir(grade_path):
-                    if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        self.image_paths.append(os.path.join(grade_path, img_name))
-                        self.labels.append(grade) # Return 0, 1, 2, 3, or 4
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert('RGB')
-        if self.crop_borders:
-            img = Image.fromarray(crop_black_borders(np.asarray(img)))
-        if self.transform:
-            img = self.transform(img)
-        return img, torch.tensor(self.labels[idx], dtype=torch.long)

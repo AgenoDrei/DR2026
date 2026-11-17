@@ -6,7 +6,7 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from misc.training import loader_kwargs
+from misc.training import loader_kwargs, add_zoom_args, zoom_settings
 
 from data.dataset import MILVideoDataset
 from dino.utils import make_val_transform_dino
@@ -109,7 +109,7 @@ def run_inference(model, loader, device, run_name, base_out_dir):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
-    val_trans = make_val_transform_dino(args.img_size, args.complex_augs)
+    val_trans = make_val_transform_dino(args.img_size, args.complex_augs, zoom=zoom_settings(args)[0])
 
     for split in args.splits:
         # Load Video Split
@@ -158,6 +158,7 @@ if __name__ == "__main__":
     parser.add_argument('--complex_augs', action='store_true')
     parser.add_argument('--no_crop_borders', dest='crop_borders', action='store_false',
                         help='Keep black borders (models trained before 2026-11-01 / with --no_crop_borders).')
+    add_zoom_args(parser)  # default center zoom 1.1 (runs since 2026-11-12); --no_zoom for earlier runs
 
     args = parser.parse_args()
     main(args)
